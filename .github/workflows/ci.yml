@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'assets/**', '.github/workflows/**', 'tests/**']
+  pull_request:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'assets/**', '.github/workflows/**', 'tests/**']
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      WAZIG_VERSION: 0.1.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WazigRust-windows-x64
+          path: target/release/wazig-rust.exe
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Copy-Item target/release/wazig-rust.exe WazigRust.exe
+          gh release create "v$env:WAZIG_VERSION" WazigRust.exe --title "Wazig Rust v$env:WAZIG_VERSION" --notes "Native Windows WhatsApp client. Requires an existing wacli login or WAZIG_HUB_URL and WAZIG_HUB_TOKEN. Portable x64 executable."
