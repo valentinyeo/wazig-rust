@@ -4,7 +4,33 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class NativeBench {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct StartupInfo {
+        public int cb; public string reserved, desktop, title;
+        public int x, y, xSize, ySize, xCountChars, yCountChars, fillAttribute, flags;
+        public short showWindow, reserved2Size;
+        public IntPtr reserved2, standardInput, standardOutput, standardError;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct ProcessInformation {
+        public IntPtr Process, Thread; public int ProcessId, ThreadId;
+    }
+    [DllImport("kernel32.dll", EntryPoint="CreateProcessW", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateProcess(string app, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr environment, string dir, ref StartupInfo startup, out ProcessInformation process);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static int Launch(string app, string args, string[] environment, int show) {
+        Array.Sort(environment, StringComparer.OrdinalIgnoreCase);
+        IntPtr block = Marshal.StringToHGlobalUni(string.Join("\0", environment) + "\0\0");
+        try {
+            var startup = new StartupInfo(); startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+            if (show >= 0) { startup.flags = 1; startup.showWindow = (short)show; }
+            ProcessInformation process;
+            if (!CreateProcess(app, new StringBuilder("\"" + app + "\" " + args), IntPtr.Zero, IntPtr.Zero, false, 0x400, block, null, ref startup, out process))
+                throw new InvalidOperationException("CreateProcess: " + Marshal.GetLastWin32Error());
+            CloseHandle(process.Process); CloseHandle(process.Thread); return process.ProcessId;
+        } finally { Marshal.FreeHGlobal(block); }
+    }
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr window);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, UIntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
@@ -53,7 +79,7 @@ function Zig-Control($Session, [hashtable]$Command) {
     if (-not $response.ok) { throw "Zig control error: $($response.error)" }
     return $response.result
 }
-function Start-App([string]$Exe, [string]$Kind) {
+function Start-App([string]$Exe, [string]$Kind, [string]$Suffix = '', [int]$Show = -1) {
     $id = [Guid]::NewGuid().ToString()
     $dir = Join-Path $root "$Kind-$id"
     $local = Join-Path $dir 'local'
@@ -65,7 +91,8 @@ function Start-App([string]$Exe, [string]$Kind) {
     $info.Environment['APPDATA'] = $local
     $info.Environment['USERPROFILE'] = $profile
     $info.Environment['USERNAME'] = "bench-$id"
-    $info.Environment['WAZIG_HUB_URL'] = $script:hub
+    $info.Environment['WAZIG_HUB_URL'] = $script:hub + $Suffix
+    $info.Environment['WAZIG_FIXTURE_URL'] = $script:hub
     $info.Environment['WAZIG_HUB_TOKEN'] = 'fixture-key-not-a-secret'
     if ($Kind -eq 'local') {
         $info.Environment['WAZIG_HUB_URL'] = ''
@@ -81,7 +108,9 @@ function Start-App([string]$Exe, [string]$Kind) {
         $info.Environment['WAZIG_VERIFY_ID'] = $id
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $app = [Diagnostics.Process]::Start($info)
+    $environment = [string[]]@($info.Environment.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" })
+    $processId = [NativeBench]::Launch($Exe, ($info.ArgumentList -join ' '), $environment, $Show)
+    $app = [Diagnostics.Process]::GetProcessById($processId)
     return @{ app = $app; user = "bench-$id"; root = $dir; clock = $clock }
 }
 function Memory($App) {
@@ -138,12 +167,14 @@ try {
     $rustStartup = @(); $rustObserved = @(); $zigStartup = @()
     # Each process gets an empty private profile: includes font extraction and media/cache setup.
     for ($i = 0; $i -lt 10; $i++) {
-        $r = Start-App $rustExe 'rust'
+        $r = Start-App $rustExe 'rust' '' (@(-1,1,2)[$i % 3])
         $script:rust = $r.app
         $state = Wait-For {
             if ($r.app.HasExited) { throw "Rust exited: $($r.app.ExitCode)" }
             try { $s = Rust-State $r.app; if ($s.chats -eq 200 -and $null -ne $s.first_chat_painted_unix_ms) { return $s } } catch [TimeoutException] {}
         } 'Rust first painted 200-chat list'
+        $r.app.Refresh()
+        if (-not [NativeBench]::IsZoomed($r.app.MainWindowHandle) -or -not $state.maximized) { throw "Rust not maximized for startup override $i" }
         $rustObserved += $r.clock.Elapsed.TotalMilliseconds
         $startEpoch = ([DateTimeOffset]$r.app.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
         $rustStartup += ([double]$state.first_chat_painted_unix_ms - $startEpoch)
@@ -153,10 +184,24 @@ try {
         $script:zig = $z.app
         $null = Wait-For {
             if ($z.app.HasExited) { throw "Zig exited: $($z.app.ExitCode)" }
-            try { $s = Zig-Control $z @{cmd='status'}; if ($s.chat_count -eq 200 -and $s.paints.list -gt 0) { return $s } } catch [TimeoutException] {}
+            try { $s = Zig-Control $z @{cmd='status'}; if ($s.chat_count -ge 200 -and $s.paints.list -gt 0) { return $s } } catch [TimeoutException] {}
         } 'Zig 200 chats and list paint'
         $zigStartup += $z.clock.Elapsed.TotalMilliseconds
         if ($i -lt 9) { Stop-App $z.app; $script:zig = $null }
+    }
+    $expected = @(Invoke-RestMethod "$hub/fixture/expected" -Headers @{Authorization='Bearer fixture-key-not-a-secret'})
+    $state = Rust-State $rust
+    if ($state.chat_rows.Count -ne 200) { throw 'Rust junk filtering failed' }
+    for ($i = 0; $i -lt 200; $i++) {
+        if ($state.chat_rows[$i].jid -cne $expected[$i].jid -or $state.chat_rows[$i].name -cne $expected[$i].name) { throw "Wrong Rust order/name at $i" }
+    }
+    $null = Zig-Control $z @{cmd='view';messenger='whatsapp'}
+    $zc = Zig-Control $z @{cmd='chats';limit=250}
+    # The hub normally filters service rows; inject them here to require Rust to reject them too.
+    $zigRows = @($zc.chats | Where-Object { $_.id -notmatch '(0@s.whatsapp.net|status@broadcast)$' })
+    if ($zigRows.Count -ne 200) { throw "Unexpected Zig comparison count $($zigRows.Count)" }
+    for ($i = 0; $i -lt 200; $i++) {
+        if ($zigRows[$i].id -cne $expected[$i].jid -or $zigRows[$i].name -cne $expected[$i].name) { throw "Rust/oracle disagrees with Zig at $i" }
     }
     # Both retained final processes are loaded against the very same server/fixtures.
     $jid = 'personal:15550000001@s.whatsapp.net'
@@ -167,6 +212,7 @@ try {
     $null = Zig-Control $z @{cmd='select'; id=$jid}
     $null = Zig-Control $z @{cmd='theme'; theme='amoled'}
     $null = Wait-For { $m = Zig-Control $z @{cmd='messages';limit=80}; @($m.messages).Count -ge 5 } 'Zig messages'
+    $null = Wait-For { (Rust-State $rust).painted_avatars -gt 0 } 'round photo avatars'
     $sendText = 'Synthetic benchmark send from Rust'
     $sent = Pipe "WazigRust-$($rust.Id)" "send $sendText"
     if (-not $sent.ok) { throw 'Control send was rejected' }
@@ -218,7 +264,15 @@ try {
     # Verify the normal-install backend too, including default executable/store paths and exact argv.
     $localSession = Start-App $rustExe 'local'
     $script:localApp = $localSession.app
-    $localState = Wait-For { $s = Rust-State $localApp; if ($s.chats -eq 1 -and $s.messages_visible -gt 0) { $s } } 'local wacli default-store history'
+    $localState = Wait-For { $s = Rust-State $localApp; if ($s.chats -eq 4 -and $s.messages_visible -gt 0) { $s } } 'local wacli default-store history'
+    if ($localSession.clock.Elapsed.TotalSeconds -ge 8) { throw 'Slow media blocked local history' }
+    $localNames = @('Fixture Local Store','Fixture Official Group','Fixture Push Name','Fixture System Name')
+    if (($localState.chat_rows.name -join '|') -cne ($localNames -join '|')) { throw 'Contact/group resolution or pinned/timestamp/name order failed' }
+    if (($localState.message_ids -join '|') -cne 'BASE|SLOW_IMAGE') { throw 'Wrapped, paginated wacli history not parsed in chronological order' }
+    $null = Pipe "WazigRust-$($localApp.Id)" 'select 15550000997@s.whatsapp.net'
+    $null = Wait-For { $s = Rust-State $localApp; $s.selected -eq '15550000997@s.whatsapp.net' -and $s.messages_visible -gt 0 } 'switch during blocked media download' 3
+    $null = Pipe "WazigRust-$($localApp.Id)" 'select 15550000999@s.whatsapp.net'
+    $null = Wait-For { (Rust-State $localApp).messages_visible -gt 0 } 'return to local chat' 3
     $fontLicense = Join-Path $localSession.root 'local/WazigRust/fonts/IBM-Plex-LICENSE.txt'
     if ((Get-FileHash $fontLicense).Hash -ne (Get-FileHash 'assets/IBM-Plex-LICENSE.txt').Hash) { throw 'Portable font licence missing or incorrect' }
     if ($localState.selected -ne '15550000999@s.whatsapp.net') { throw 'Wrong local-store chat' }
@@ -228,21 +282,87 @@ try {
     if ((Get-Content (Join-Path $store 'sent.txt') -Raw) -ne 'Synthetic local store send') { throw 'Send did not reach default wacli store' }
     Copy-Item (Join-Path $store 'argv.jsonl') (Join-Path $evidence 'local-wacli-argv.jsonl')
     $localState | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'local-wacli-state.json')
+    $null = Wait-For { (Rust-State $localApp).painted_avatars -gt 0 } 'wacli profile URL and round mask' 45
     Stop-App $localApp; $script:localApp = $null
+    Write-Output 'ROUND2 PASS: maximized order names messages'
+    Stop-App $rust; Stop-App $zig
+    $script:rust = $null; $script:zig = $null
+    # Both large-image processes get fresh profiles and identical 50 x 4000x3000 JPEGs.
+    $largeR = Start-App $rustExe 'rust' '/large/rust'
+    $script:rust = $largeR.app
+    $largeZ = Start-App $zigExe 'zig' '/large/zig'
+    $script:zig = $largeZ.app
+    $null = Wait-For { (Rust-State $script:rust).chats -eq 5 } 'large Rust chat list'
+    $null = Wait-For { (Zig-Control $largeZ @{cmd='status'}).chat_count -eq 5 } 'large Zig chat list'
+    $null = Zig-Control $largeZ @{cmd='theme';theme='amoled'}
+    $seen = [Collections.Generic.HashSet[string]]::new()
+    $largeTrace = [Collections.Generic.List[object]]::new()
+    foreach ($chat in $expected[0..4]) {
+        $null = Pipe "WazigRust-$($script:rust.Id)" "select $($chat.jid)"
+        $null = Zig-Control $largeZ @{cmd='select';id=$chat.jid}
+        $null = Wait-For { $s = Rust-State $script:rust; $s.selected -eq $chat.jid -and $s.messages_loaded -eq 10 } 'large Rust history'
+        $null = Wait-For { @((Zig-Control $largeZ @{cmd='messages';limit=80}).messages).Count -eq 10 } 'large Zig history'
+        # Before scrolling, the other photos in this chat must not have been eagerly fetched.
+        $requests = Invoke-RestMethod "$hub/fixture/state" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+        $forChat = @($requests.media_requests.rust | Where-Object { $_ -like "*/$([uri]::EscapeDataString($chat.jid))/*" })
+        if ($forChat.Count -ge 10) { throw 'Rust eagerly downloaded off-screen photos' }
+        $script:zig.Refresh()
+        $wr = [NativeBench+Rect]::new()
+        $null = [NativeBench]::GetWindowRect($script:zig.MainWindowHandle, [ref]$wr)
+        $px = [int]($wr.Left + ($wr.Right-$wr.Left)*3/4)
+        $py = [int]($wr.Top + ($wr.Bottom-$wr.Top)/2)
+        $point = [IntPtr](($py -shl 16) -bor ($px -band 0xffff))
+        for ($step = 0; $step -lt 35; $step++) {
+            $s = Wait-For {
+                $v = Rust-State $script:rust
+                if ($v.painted_images.Count -gt 0 -and $v.painted_images.Count -eq $v.visible_images.Count) { $v }
+            } 'visible large JPEG decoded'
+            foreach ($id in $s.painted_images) { $null = $seen.Add($id) }
+            if ($s.bitmap_bytes -gt 4MB -or $s.images_cached -gt 32) { throw 'Decoded bitmap LRU exceeded its budget' }
+            $largeTrace.Add(@{ chat=$chat.jid; step=$step; state=$s; rust=(Memory $script:rust); zig=(Memory $script:zig) })
+            $paint = $s.paints
+            $null = Pipe "WazigRust-$($script:rust.Id)" 'scroll 140'
+            $null = Wait-For { (Rust-State $script:rust).paints -gt $paint } 'Rust image scroll paint'
+            $zPaint = (Zig-Control $largeZ @{cmd='status'}).paints.canvas
+            $null = [NativeBench]::PostMessage($script:zig.MainWindowHandle, 0x20A, [UIntPtr](280 -shl 16), $point)
+            $null = Wait-For { (Zig-Control $largeZ @{cmd='status'}).paints.canvas -gt $zPaint } 'Zig image scroll paint'
+        }
+    }
+    if ($seen.Count -ne 50) { throw "Only $($seen.Count)/50 large photos actually painted" }
+    $requests = Wait-For {
+        $v = Invoke-RestMethod "$hub/fixture/state" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+        if (@($v.media_requests.rust).Count -eq 50 -and @($v.media_requests.zig).Count -eq 50) { $v }
+    } 'both apps downloaded all 50 large JPEGs' 90
+    $largeTrace | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'large-image-trace.json')
+    $largeSamples = @()
+    # Same quiet one-minute window; compare unrounded median private bytes, no working-set trimming.
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Seconds 5
+        $script:rust.Refresh(); $script:zig.Refresh()
+        $largeSamples += @{rust=(Memory $script:rust);zig=(Memory $script:zig);rust_private=$script:rust.PrivateMemorySize64;zig_private=$script:zig.PrivateMemorySize64}
+    }
+    $largeRust = @{working_set=(Median $largeSamples.rust.working_set);private_bytes=(Median $largeSamples.rust.private_bytes)}
+    $largeZig = @{working_set=(Median $largeSamples.zig.working_set);private_bytes=(Median $largeSamples.zig.private_bytes)}
+    $largeProof = @{rust=$largeRust;zig=$largeZig;samples=$largeSamples;painted=$seen.Count;requests=$requests;rust_commit=$env:GITHUB_SHA}
+    $largeProof | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'large-image-memory.json')
+    Write-Output "Large JPEG memory MiB: Rust WS=$($largeRust.working_set) private=$($largeRust.private_bytes); Zig WS=$($largeZig.working_set) private=$($largeZig.private_bytes)"
+    if ((Median $largeSamples.rust_private) -gt (Median $largeSamples.zig_private)) { throw 'Rust large-image private memory exceeds Zig' }
+    Write-Output 'ROUND2 PASS: large-image memory rust<=zig'
     $rustBytes = (Get-Item $rustExe).Length; $zigBytes = (Get-Item $zigExe).Length
     $numbers = [ordered]@{
         rust_startup_ms = $rustStartup; rust_observed_startup_ms = $rustObserved; zig_observed_startup_ms = $zigStartup
         rust_key_to_paint_ms = $latencies; rust_load = $rustLoad; zig_load = $zigLoad
+        large_rust = $largeRust; large_zig = $largeZig
         rust_idle = $rustIdle; zig_idle = $zigIdle; rust_exe_bytes = $rustBytes; zig_exe_bytes = $zigBytes
         profile3_startup_ms = $profile3Startup; profile3_keys_ms = $profile3Keys; profile3_exe_bytes = (Get-Item $profile3Exe).Length
         zig_version = $latest.tagName; rust_commit = $env:GITHUB_SHA
-        state = (Rust-State $rust); backend_send_count = $backend.sends.Count
+        state = (Rust-State $script:rust); backend_send_count = $backend.sends.Count
     }
     $numbers | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'measurements.json')
     $report = @"
 # Wazig native WhatsApp benchmark
 
-200 synthetic chats; same loopback WhatsApp hub and fake image/reply fixture. Windows hosted runner, x64. Rust commit $env:GITHUB_SHA; Zig $($latest.tagName).
+200 synthetic chats (plus injected junk), mixed activity timestamps, contact/push/group names; same loopback WhatsApp hub and fake image/reply fixture. Windows hosted runner, x64. Rust commit $env:GITHUB_SHA; Zig $($latest.tagName).
 
 | Metric | Rust | Zig $($latest.tagName) |
 |---|---:|---:|
@@ -253,6 +373,8 @@ try {
 | Private Bytes after load, MiB | $($rustLoad.private_bytes) | $($zigLoad.private_bytes) |
 | Working Set after 2 minutes idle, MiB | $($rustIdle.working_set) | $($zigIdle.working_set) |
 | Private Bytes after 2 minutes idle, MiB | $($rustIdle.private_bytes) | $($zigIdle.private_bytes) |
+| Working Set, 50 large JPEGs + 1 minute idle, MiB | $($largeRust.working_set) | $($largeZig.working_set) |
+| Private Bytes, 50 large JPEGs + 1 minute idle, MiB | $($largeRust.private_bytes) | $($largeZig.private_bytes) |
 | Executable size, bytes | $rustBytes | $zigBytes |
 
 PASS: Rust launched, painted 200 chats, selected a chat, rendered messages, and sent a message confirmed independently by the fake server. The normal-install wacli backend also loaded history and sent successfully through the default executable and store paths with exact argv assertions. Screenshot contains FAKE data only.

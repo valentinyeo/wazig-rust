@@ -2,12 +2,14 @@ use crate::model::{self, Chat, Message};
 use serde_json::{json, Value};
 use std::os::windows::process::CommandExt;
 use std::{
+    collections::HashMap,
     env,
+    hash::{Hash, Hasher},
     path::PathBuf,
     process::Command,
     sync::mpsc,
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
     core::{w, PCWSTR},
@@ -20,12 +22,14 @@ pub enum Job {
     Send(String, String),
     Archive(String, bool),
     MarkRead(String),
+    Asset(String, String),
 }
 pub enum Event {
     Chats(bool, Result<Vec<Chat>, String>),
     Messages(String, Result<Vec<Message>, String>),
     Sent(String, String, Result<(), String>),
     Changed(Result<(), String>),
+    Asset(String, String, Result<String, String>),
 }
 
 pub fn settings_dir() -> PathBuf {
@@ -278,11 +282,15 @@ impl Hub {
 struct Backend {
     hub: Option<Hub>,
     wacli: PathBuf,
+    names: HashMap<String, String>,
+    names_updated: Option<Instant>,
 }
 impl Backend {
     fn new() -> Self {
         let url = environment("WAZIG_HUB_URL");
         Self {
+            names: HashMap::new(),
+            names_updated: None,
             hub: if url.trim().is_empty() {
                 None
             } else {
@@ -320,7 +328,7 @@ impl Backend {
         }
         Ok(out.stdout)
     }
-    fn chats(&self, archived: bool) -> Result<Vec<Chat>, String> {
+    fn chats(&mut self, archived: bool) -> Result<Vec<Chat>, String> {
         let bytes = if let Some(h) = &self.hub {
             h.request(
                 &format!("/v1/wazig/chats?archived={archived}&limit=250"),
@@ -341,7 +349,48 @@ impl Backend {
                 },
             ])?
         };
-        model::chats(&bytes)
+        let mut chats = model::chats(&bytes)?;
+        if self.hub.is_none() {
+            if self
+                .names_updated
+                .is_none_or(|t| t.elapsed().as_secs() >= 60)
+            {
+                let mut names = HashMap::new();
+                for (args, groups) in [
+                    (
+                        vec![
+                            "--json",
+                            "--read-only",
+                            "contacts",
+                            "search",
+                            "@",
+                            "--limit",
+                            "10000",
+                        ],
+                        false,
+                    ),
+                    (
+                        vec!["--json", "--read-only", "groups", "list", "--limit", "1000"],
+                        true,
+                    ),
+                ] {
+                    if let Ok(raw) = self.cli(&args) {
+                        if let Ok(rows) = model::names(&raw, groups) {
+                            names.extend(rows);
+                        }
+                    }
+                }
+                self.names = names;
+                self.names_updated = Some(Instant::now());
+            }
+            for c in &mut chats {
+                if let Some(name) = self.names.get(&c.jid) {
+                    c.name.clone_from(name);
+                }
+            }
+            model::finish_chats(&mut chats);
+        }
+        Ok(chats)
     }
     fn messages(&self, jid: &str) -> Result<Vec<Message>, String> {
         let bytes = if let Some(h) = &self.hub {
@@ -364,39 +413,60 @@ impl Backend {
                 "80",
             ])?
         };
-        let mut messages = model::messages(&bytes, jid, self.hub.is_some())?;
-        for m in &mut messages {
-            if m.media_type != "image" || !m.local_path.is_empty() {
-                continue;
+        // Deliver history before any network media work: one missing photo must not hide a chat.
+        model::messages(&bytes, jid, self.hub.is_some())
+    }
+    fn asset(&self, jid: &str, id: &str) -> Result<String, String> {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (jid, id).hash(&mut hash);
+        let cache = settings_dir().join(if id.is_empty() { "avatars" } else { "media" });
+        std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+        let path = cache.join(format!("{:016x}", hash.finish()));
+        if path.exists() {
+            return Ok(path.to_string_lossy().into());
+        }
+        if let Some(h) = &self.hub {
+            let route = if id.is_empty() {
+                format!("/v1/wazig/avatar/{}", model::encode(jid))
+            } else {
+                format!(
+                    "/v1/wazig/media/{}/{}",
+                    model::encode(jid),
+                    model::encode(id)
+                )
+            };
+            std::fs::write(&path, h.request(&route, None)?).map_err(|e| e.to_string())?;
+        } else if id.is_empty() {
+            let raw = self.cli(&[
+                "--json",
+                "--lock-wait",
+                "10s",
+                "--timeout",
+                "30s",
+                "profile",
+                "picture-info",
+                "--jid",
+                jid,
+            ])?;
+            let v: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            let url = v
+                .pointer("/data/url")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or("No profile picture")?;
+            // Same URLMon download as Zig; profile URLs are not hub-authenticated requests.
+            unsafe {
+                windows::Win32::System::Com::Urlmon::URLDownloadToFileW(
+                    None,
+                    PCWSTR(wide(url).as_ptr()),
+                    PCWSTR(wide(&path.to_string_lossy()).as_ptr()),
+                    0,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
             }
-            let cache = settings_dir().join("media");
-            let _ = std::fs::create_dir_all(&cache);
-            // Encode every byte so opaque identifiers cannot become paths.
-            let key: String = format!("{jid}/{}", m.id)
-                .bytes()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            if key.len() > 220 {
-                continue;
-            }
-            let path = cache.join(key);
-            if let Some(h) = &self.hub {
-                if !path.exists() {
-                    if let Ok(bytes) = h.request(
-                        &format!(
-                            "/v1/wazig/media/{}/{}",
-                            model::encode(jid),
-                            model::encode(&m.id)
-                        ),
-                        None,
-                    ) {
-                        let _ = std::fs::write(&path, bytes);
-                    }
-                }
-                if path.exists() {
-                    m.local_path = path.to_string_lossy().into();
-                }
-            } else if let Ok(raw) = self.cli(&[
+        } else {
+            let raw = self.cli(&[
                 "--json",
                 "--lock-wait",
                 "10s",
@@ -407,19 +477,18 @@ impl Backend {
                 "--chat",
                 jid,
                 "--id",
-                &m.id,
-            ]) {
-                if let Ok(v) = serde_json::from_slice::<Value>(&raw) {
-                    m.local_path = v
-                        .pointer("/data/path")
-                        .or_else(|| v.pointer("/data/LocalPath"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .into();
-                }
-            }
+                id,
+            ])?;
+            let v: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            return v
+                .pointer("/data/path")
+                .or_else(|| v.pointer("/data/LocalPath"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .ok_or_else(|| "No downloaded media path".into());
         }
-        Ok(messages)
+        Ok(path.to_string_lossy().into())
     }
     fn send(&self, jid: &str, text: &str) -> Result<(), String> {
         if let Some(h) = &self.hub {
@@ -494,10 +563,33 @@ pub fn start(hwnd: HWND, wake: u32) -> (mpsc::Sender<Job>, mpsc::Receiver<Event>
     let (tx, rx) = mpsc::channel();
     let (events, receiver) = mpsc::channel();
     let window = hwnd.0 as usize;
+    let (assets, asset_rx) = mpsc::sync_channel::<(String, String)>(1);
+    let asset_events = events.clone();
     thread::spawn(move || {
         let backend = Backend::new();
+        while let Ok((jid, id)) = asset_rx.recv() {
+            let result = backend.asset(&jid, &id);
+            if asset_events.send(Event::Asset(jid, id, result)).is_err() {
+                break;
+            }
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    HWND(window as *mut _),
+                    wake,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+    thread::spawn(move || {
+        let mut backend = Backend::new();
         while let Ok(job) = rx.recv() {
             let event = match job {
+                Job::Asset(jid, id) => {
+                    let _ = assets.send((jid, id));
+                    continue;
+                }
                 Job::Chats(a) => Event::Chats(a, backend.chats(a)),
                 Job::Messages(j) => {
                     let result = backend.messages(&j);

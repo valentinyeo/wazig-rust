@@ -8,7 +8,7 @@ concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 permissions:
-  contents: read
+  contents: write
 jobs:
   compare:
     runs-on: windows-latest
@@ -27,6 +27,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'opt-level=3 build failed' }
           Move-Item target/release/wazig-rust.exe target/release/wazig-rust-3.exe -Force
           Move-Item target/release/wazig-rust-z.exe target/release/wazig-rust.exe -Force
+      - run: python -m pip install Pillow
       - name: Build native wacli contract fixture
         run: rustc --edition 2021 -O tests/fake_wacli.rs -o target/release/fake-wacli.exe
       - name: Verify fake WhatsApp and compare native apps
@@ -39,3 +40,14 @@ jobs:
         with:
           name: native-whatsapp-bench
           path: bench-evidence/
+      - name: Publish verified release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ci = gh run list -w ci -b main --commit $env:GITHUB_SHA -L 1 --json conclusion | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $ci[0].conclusion -ne 'success') { throw 'CI must pass on the same commit before release' }
+          $version = (Get-Content Cargo.toml | Select-String '^version = "([^"]+)"').Matches.Groups[1].Value
+          Copy-Item target/release/wazig-rust.exe WazigRust.exe
+          gh release create "v$version" WazigRust.exe bench-evidence/bench.md bench-evidence/measurements.json bench-evidence/large-image-memory.json --target $env:GITHUB_SHA --title "Wazig Rust v$version" --notes "Round 2: launcher-proof maximized startup, Zig chat ordering, contact/push/group names, immediate history, round photo avatars, visible-only media and display-size WIC decoding with a byte-bounded LRU. CI and the native Rust/Zig 50-large-JPEG benchmark passed on this commit. See attached bench.md for measurements. Portable x64 executable; requires existing wacli login or hub settings."
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }

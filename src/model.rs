@@ -11,6 +11,7 @@ pub struct Chat {
     pub account: String,
     pub unread_count: u32,
     pub archived: bool,
+    pub pinned: bool,
     pub last_message_ts: String,
 }
 
@@ -80,6 +81,9 @@ fn rows(raw: &[u8], messages: bool) -> Result<Value, String> {
             v = m.take();
         }
     }
+    if v.is_null() {
+        v = Value::Array(Vec::new());
+    }
     if !v.is_array() {
         return Err("Backend did not return an array".into());
     }
@@ -89,9 +93,51 @@ fn rows(raw: &[u8], messages: bool) -> Result<Value, String> {
 pub fn chats(raw: &[u8]) -> Result<Vec<Chat>, String> {
     let mut chats: Vec<Chat> =
         serde_json::from_value(rows(raw, false)?).map_err(|e| e.to_string())?;
-    chats.retain(|c| !c.jid.is_empty() && (c.provider.is_empty() || c.provider == "whatsapp"));
-    chats.sort_by(|a, b| b.last_message_ts.cmp(&a.last_message_ts));
+    finish_chats(&mut chats);
     Ok(chats)
+}
+
+pub fn finish_chats(chats: &mut Vec<Chat>) {
+    chats.retain(|c| {
+        let jid = c.jid.rsplit(':').next().unwrap_or(&c.jid);
+        !jid.is_empty()
+            && jid != "0@s.whatsapp.net"
+            && !jid.ends_with("@broadcast")
+            && (c.provider.is_empty() || c.provider == "whatsapp")
+            && !(c.kind == "unknown"
+                && !jid.contains('@')
+                && (c.name.is_empty() || c.name == c.jid))
+    });
+    // Zig compares display names as UTF-16, then uses the JID to break equal-name ties.
+    chats.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.last_message_ts.cmp(&a.last_message_ts))
+            .then_with(|| a.name.encode_utf16().cmp(b.name.encode_utf16()))
+            .then_with(|| a.jid.cmp(&b.jid))
+    });
+}
+
+pub fn names(raw: &[u8], groups: bool) -> Result<Vec<(String, String)>, String> {
+    let rows = rows(raw, false)?;
+    Ok(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| {
+            let jid = row.get(if groups { "JID" } else { "jid" })?.as_str()?;
+            let keys: &[&str] = if groups {
+                &["Name"]
+            } else {
+                &["alias", "system_name", "name", "phone"]
+            };
+            let name = keys
+                .iter()
+                .filter_map(|k| row.get(k)?.as_str())
+                .find(|s| !s.is_empty())?;
+            Some((jid.into(), name.into()))
+        })
+        .collect())
 }
 
 pub fn messages(raw: &[u8], chat: &str, hub: bool) -> Result<Vec<Message>, String> {
@@ -182,6 +228,33 @@ mod tests {
         assert_eq!(m[0].reaction, "ok");
         assert_eq!(m[0].quote(), Some(("quote", "body")));
         assert!(messages(raw, "other", true).is_err());
+    }
+    #[test]
+    fn zig_order_names_and_junk() {
+        let mut c = chats(br#"[{"jid":"z@s.whatsapp.net","name":"Zulu","last_message_ts":"2026-01-03"},{"jid":"b@s.whatsapp.net","name":"Alpha","last_message_ts":"2026-01-03"},{"jid":"a@s.whatsapp.net","name":"Alpha","last_message_ts":"2026-01-03"},{"jid":"p@s.whatsapp.net","name":"Pinned","pinned":true,"last_message_ts":"2020"},{"jid":"0@s.whatsapp.net"},{"jid":"personal:status@broadcast"},{"jid":"opaque","kind":"unknown"},{"jid":"unknown@s.whatsapp.net"}]"#).unwrap();
+        finish_chats(&mut c);
+        assert_eq!(
+            c.iter().map(|c| c.jid.as_str()).collect::<Vec<_>>(),
+            [
+                "p@s.whatsapp.net",
+                "a@s.whatsapp.net",
+                "b@s.whatsapp.net",
+                "z@s.whatsapp.net",
+                "unknown@s.whatsapp.net"
+            ]
+        );
+        assert_eq!(names(br#"{"data":[{"jid":"a","alias":"Alias","system_name":"System","name":"Push"},{"jid":"b","name":"Push"}]}"#, false).unwrap(), [("a".into(), "Alias".into()), ("b".into(), "Push".into())]);
+        assert_eq!(
+            names(
+                br#"{"data":[{"JID":"g@g.us","Name":"Official Group"}]}"#,
+                true
+            )
+            .unwrap(),
+            [("g@g.us".into(), "Official Group".into())]
+        );
+        assert!(messages(br#"{"data":{"messages":null}}"#, "j", false)
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn hub_paths_are_not_trusted() {

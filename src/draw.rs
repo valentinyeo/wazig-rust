@@ -42,7 +42,8 @@ pub struct Painter {
     brush: ID2D1SolidColorBrush,
     wic: IWICImagingFactory,
     layouts: VecDeque<(String, u32, u32, bool, IDWriteTextLayout, f32)>,
-    bitmaps: VecDeque<(String, ID2D1Bitmap)>,
+    bitmaps: VecDeque<(String, u32, u32, bool, ID2D1Bitmap)>,
+    bitmap_bytes: usize,
 }
 impl Painter {
     pub unsafe fn new(hwnd: HWND, width: u32, height: u32, dpi: f32) -> Result<Self> {
@@ -114,6 +115,7 @@ impl Painter {
             wic,
             layouts: VecDeque::new(),
             bitmaps: VecDeque::new(),
+            bitmap_bytes: 0,
         })
     }
     pub unsafe fn fill(&self, r: D2D_RECT_F, radius: f32, rgb: u32) {
@@ -227,10 +229,17 @@ impl Painter {
     pub fn images_cached(&self) -> usize {
         self.bitmaps.len()
     }
-    unsafe fn bitmap(&mut self, path: &str) -> Result<ID2D1Bitmap> {
-        if let Some(i) = self.bitmaps.iter().position(|(p, _)| p == path) {
+    pub fn bitmap_bytes(&self) -> usize {
+        self.bitmap_bytes
+    }
+    unsafe fn bitmap(&mut self, path: &str, w: u32, h: u32, round: bool) -> Result<ID2D1Bitmap> {
+        if let Some(i) = self
+            .bitmaps
+            .iter()
+            .position(|(p, cw, ch, cr, _)| p == path && *cw == w && *ch == h && *cr == round)
+        {
             let entry = self.bitmaps.remove(i).unwrap();
-            let bitmap = entry.1.clone();
+            let bitmap = entry.4.clone();
             self.bitmaps.push_back(entry);
             return Ok(bitmap);
         }
@@ -239,20 +248,38 @@ impl Painter {
             PCWSTR(path_wide.as_ptr()),
             None,
             GENERIC_READ,
-            WICDecodeMetadataCacheOnLoad,
+            WICDecodeMetadataCacheOnDemand,
         )?;
         let source = decoder.GetFrame(0)?;
         let (mut width, mut height) = (0, 0);
         source.GetSize(&mut width, &mut height)?;
-        // Bound decoded GPU/cache memory even for large phone photos.
-        let scale = (960. / width.max(height).max(1) as f32).min(1.);
-        let scaler = self.wic.CreateBitmapScaler()?;
-        scaler.Initialize(
-            &source,
+        let source: IWICBitmapSource = if round {
+            let side = width.min(height);
+            let clipper = self.wic.CreateBitmapClipper()?;
+            clipper.Initialize(
+                &source,
+                &WICRect {
+                    X: ((width - side) / 2) as i32,
+                    Y: ((height - side) / 2) as i32,
+                    Width: side as i32,
+                    Height: side as i32,
+                },
+            )?;
+            width = side;
+            height = side;
+            clipper.cast()?
+        } else {
+            source.cast()?
+        };
+        let scale = (w as f32 / width.max(1) as f32)
+            .min(h as f32 / height.max(1) as f32)
+            .min(1.);
+        let (width, height) = (
             (width as f32 * scale).max(1.) as u32,
             (height as f32 * scale).max(1.) as u32,
-            WICBitmapInterpolationModeFant,
-        )?;
+        );
+        let scaler = self.wic.CreateBitmapScaler()?;
+        scaler.Initialize(&source, width, height, WICBitmapInterpolationModeFant)?;
         let converter = self.wic.CreateFormatConverter()?;
         converter.Initialize(
             &scaler,
@@ -262,19 +289,56 @@ impl Painter {
             0.,
             WICBitmapPaletteTypeCustom,
         )?;
-        let bitmap = self.target.CreateBitmapFromWicBitmap(&converter, None)?;
-        if self.bitmaps.len() >= 8 {
-            self.bitmaps.pop_front();
+        let bitmap = if round {
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            converter.CopyPixels(std::ptr::null(), width * 4, &mut pixels)?;
+            mask_circle(&mut pixels, width as usize);
+            self.target.CreateBitmap(
+                D2D_SIZE_U { width, height },
+                Some(pixels.as_ptr().cast()),
+                width * 4,
+                &D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.,
+                    dpiY: 96.,
+                },
+            )?
+        } else {
+            self.target.CreateBitmapFromWicBitmap(&converter, None)?
+        };
+        let bytes = (width * height * 4) as usize;
+        // LRU is bounded by decoded bytes as well as count, not original file size.
+        while !self.bitmaps.is_empty()
+            && (self.bitmap_bytes + bytes > 4 * 1024 * 1024 || self.bitmaps.len() >= 32)
+        {
+            let old = self.bitmaps.pop_front().unwrap().4.GetPixelSize();
+            self.bitmap_bytes -= (old.width * old.height * 4) as usize;
         }
-        self.bitmaps.push_back((path.into(), bitmap.clone()));
+        self.bitmap_bytes += bytes;
+        self.bitmaps
+            .push_back((path.into(), w, h, round, bitmap.clone()));
         Ok(bitmap)
     }
     pub unsafe fn image(&mut self, path: &str, r: D2D_RECT_F) -> bool {
-        if let Ok(bitmap) = self.bitmap(path) {
+        self.draw_image(path, r, false)
+    }
+    pub unsafe fn avatar(&mut self, path: &str, r: D2D_RECT_F) -> bool {
+        self.draw_image(path, r, true)
+    }
+    unsafe fn draw_image(&mut self, path: &str, r: D2D_RECT_F, round: bool) -> bool {
+        let (mut dx, mut dy) = (96., 96.);
+        self.target.GetDpi(&mut dx, &mut dy);
+        if let Ok(bitmap) = self.bitmap(
+            path,
+            ((r.right - r.left) * dx / 96.).ceil() as u32,
+            ((r.bottom - r.top) * dy / 96.).ceil() as u32,
+            round,
+        ) {
             let size = bitmap.GetSize();
-            let scale = ((r.right - r.left) / size.width)
-                .min((r.bottom - r.top) / size.height)
-                .min(1.);
+            let scale = ((r.right - r.left) / size.width).min((r.bottom - r.top) / size.height);
             let dest = rect(r.left, r.top, size.width * scale, size.height * scale);
             self.target.DrawBitmap(
                 &bitmap,
@@ -286,6 +350,39 @@ impl Painter {
             true
         } else {
             false
+        }
+    }
+}
+
+fn mask_circle(pixels: &mut [u8], size: usize) {
+    let radius = size as f32 / 2.;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - radius;
+            let dy = y as f32 + 0.5 - radius;
+            let alpha = ((0.5 - ((dx * dx + dy * dy).sqrt() - radius)).clamp(0., 1.) * 255.) as u16;
+            for channel in &mut pixels[(y * size + x) * 4..(y * size + x + 1) * 4] {
+                *channel = (*channel as u16 * alpha / 255) as u8;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn zig_avatar_mask_premultiplies_and_clears_corners() {
+        for size in [42, 63] {
+            let mut pixels = vec![128; size * size * 4];
+            mask_circle(&mut pixels, size);
+            assert_eq!(&pixels[..4], &[0; 4]);
+            assert_eq!(pixels[(size / 2 * size + size / 2) * 4 + 3], 128);
+            let edge = pixels[(size / 2 * size + size - 1) * 4 + 3];
+            assert!(edge > 0 && edge < 128);
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel[0], pixel[3]);
+            }
         }
     }
 }

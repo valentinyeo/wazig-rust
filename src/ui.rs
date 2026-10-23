@@ -72,6 +72,11 @@ struct App {
     dpi: f32,
     surrogate: Option<u16>,
     suppress_c: bool,
+    assets: HashMap<(String, String), Option<String>>,
+    asset_pending: bool,
+    painted_images: Vec<String>,
+    visible_images: Vec<String>,
+    painted_avatars: usize,
 }
 impl App {
     fn refresh(&mut self) {
@@ -148,6 +153,13 @@ impl App {
     fn events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
+                Event::Asset(jid, id, result) => {
+                    self.asset_pending = false;
+                    if self.assets.len() >= 512 {
+                        self.assets.clear();
+                    }
+                    self.assets.insert((jid, id), result.ok());
+                }
                 Event::Chats(archived, result) => {
                     self.chats_pending = false;
                     if archived != self.archived {
@@ -218,7 +230,10 @@ impl App {
     }
     fn state(&self) -> serde_json::Value {
         json!({"chats":self.chats.len(),"selected":self.selected,"messages_visible":self.visible,
-            "messages_loaded":self.messages.len(),
+            "messages_loaded":self.messages.len(), "maximized":unsafe { IsZoomed(self.hwnd).as_bool() },
+            "chat_rows":self.chats,"message_ids":self.messages.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            "painted_images":self.painted_images,"visible_images":self.visible_images,"painted_avatars":self.painted_avatars,
+            "bitmap_bytes":self.painter.as_ref().map(Painter::bitmap_bytes).unwrap_or(0),
             "focus":match self.focus {Focus::List=>"list",Focus::Search=>"search",Focus::Composer=>"composer",Focus::Commands=>"commands",Focus::Help=>"help"},
             "search_matches":self.indices().len(),"sidebar_scroll":self.list_scroll,
             "images_cached":self.painter.as_ref().map(Painter::images_cached).unwrap_or(0),"composer_characters":self.draft.chars().count(),"last_send_status":self.last_send_status,"status":self.status,
@@ -230,6 +245,14 @@ impl App {
         while let Ok(request) = self.control.try_recv() {
             let result = if request.command == "state" {
                 self.state()
+            } else if let Some(delta) = request.command.strip_prefix("scroll ") {
+                if let Ok(delta) = delta.parse::<f32>() {
+                    self.message_scroll = (self.message_scroll + delta).max(0.);
+                    self.invalidate();
+                    json!({"ok":true})
+                } else {
+                    json!({"ok":false})
+                }
             } else if let Some(jid) = request.command.strip_prefix("select ") {
                 if self.chats.iter().any(|c| c.jid == jid) {
                     self.select(jid.into());
@@ -540,6 +563,11 @@ impl App {
     }
     unsafe fn draw(&mut self, p: &mut Painter, width: f32, height: f32) {
         use draw::rect;
+        self.painted_images.clear();
+        self.visible_images.clear();
+        self.painted_avatars = 0;
+        let mut avatar_request = None;
+        let mut image_request = None;
         p.fill(rect(SIDEBAR - 1., 0., 1., height), 0., 0x202020);
         p.fill(rect(16., 18., SIDEBAR - 32., 43.), 22., 0x1e1e1e);
         let search = if self.search.is_empty() {
@@ -589,6 +617,14 @@ impl App {
                 true,
                 WHITE,
             );
+            let key = (c.jid.clone(), String::new());
+            if let Some(Some(path)) = self.assets.get(&key) {
+                if p.avatar(path, rect(20., y + 8., 44., 44.)) {
+                    self.painted_avatars += 1;
+                }
+            } else if !self.assets.contains_key(&key) && avatar_request.is_none() {
+                avatar_request = Some(key);
+            }
             p.circle(57., y + 46., 9., GREEN);
             p.text("◔", rect(51., y + 37., 14., 18.), 14., true, 0x000000);
             let name = if c.name.is_empty() { &c.jid } else { &c.name };
@@ -726,9 +762,24 @@ impl App {
                     content_y += 64.;
                 }
                 if m.media_type == "image" {
-                    if m.local_path.is_empty()
-                        || !p.image(&m.local_path, rect(x + 16., content_y, text_width, 210.))
-                    {
+                    self.visible_images.push(m.id.clone());
+                    let key = (self.selected.clone(), m.id.clone());
+                    let path = if !m.local_path.is_empty() {
+                        Some(m.local_path.as_str())
+                    } else {
+                        self.assets.get(&key).and_then(|p| p.as_deref())
+                    };
+                    if path.is_some_and(|path| {
+                        p.image(path, rect(x + 16., content_y, text_width, 210.))
+                    }) {
+                        self.painted_images.push(m.id.clone());
+                    } else {
+                        if path.is_none()
+                            && !self.assets.contains_key(&key)
+                            && image_request.is_none()
+                        {
+                            image_request = Some(key);
+                        }
                         p.fill(rect(x + 16., content_y, text_width, 210.), 8., 0x2c2c2c);
                         p.text(
                             "Image loading…",
@@ -769,6 +820,11 @@ impl App {
             y += h + gap;
         }
         p.target.PopAxisAlignedClip();
+        if !self.asset_pending {
+            if let Some((jid, id)) = image_request.or(avatar_request) {
+                self.asset_pending = self.jobs.send(Job::Asset(jid, id)).is_ok();
+            }
+        }
         p.fill(
             rect(SIDEBAR + 24., height - 88., width - SIDEBAR - 48., 62.),
             31.,
@@ -970,7 +1026,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 fn version() -> &'static str {
-    option_env!("WAZIG_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+    env!("CARGO_PKG_VERSION")
 }
 
 pub fn run() -> Result<()> {
@@ -998,7 +1054,7 @@ pub fn run() -> Result<()> {
             WINDOW_EX_STYLE::default(),
             class,
             PCWSTR(title.as_ptr()),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_MAXIMIZE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
@@ -1055,9 +1111,18 @@ pub fn run() -> Result<()> {
             dpi: GetDpiForWindow(hwnd) as f32,
             surrogate: None,
             suppress_c: false,
+            assets: HashMap::new(),
+            asset_pending: false,
+            painted_images: Vec::new(),
+            visible_images: Vec::new(),
+            painted_avatars: 0,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *app as *mut App) as isize);
         let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        // STARTF_USESHOWWINDOW can override the first ShowWindow (shortcuts/updaters).
+        if !IsZoomed(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
         app.refresh();
         SetTimer(hwnd, 1, 5000, None);
         let mut msg = MSG::default();
