@@ -220,7 +220,8 @@ impl App {
         json!({"chats":self.chats.len(),"selected":self.selected,"messages_visible":self.visible,
             "messages_loaded":self.messages.len(),
             "focus":match self.focus {Focus::List=>"list",Focus::Search=>"search",Focus::Composer=>"composer",Focus::Commands=>"commands",Focus::Help=>"help"},
-            "search_matches":self.indices().len(),"composer_characters":self.draft.chars().count(),"last_send_status":self.last_send_status,"status":self.status,
+            "search_matches":self.indices().len(),"sidebar_scroll":self.list_scroll,
+            "images_cached":self.painter.as_ref().map(Painter::images_cached).unwrap_or(0),"composer_characters":self.draft.chars().count(),"last_send_status":self.last_send_status,"status":self.status,
             "first_chat_painted_ms":self.first_paint_ms,"first_chat_painted_unix_ms":self.first_paint_unix_ms,
             "key_to_paint_ms":self.latencies,"paints":self.paints,"archived":self.archived,
             "title":format!("Wazig Rust v{}",version())})
@@ -747,7 +748,7 @@ impl App {
                     false,
                     WHITE,
                 );
-                p.text(
+                p.right_text(
                     m.time(),
                     rect(x + bubble_width - 60., y + h - 22., 48., 18.),
                     11.,
@@ -846,7 +847,7 @@ impl App {
                         false,
                         WHITE,
                     );
-                    p.text(
+                    p.right_text(
                         COMMANDS[i].1,
                         rect(left + 450., y + 12., 90., 25.),
                         13.,

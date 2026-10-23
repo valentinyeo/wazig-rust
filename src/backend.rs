@@ -49,7 +49,7 @@ fn environment(name: &str) -> String {
         .is_ok()
             && bytes > 2
             && bytes <= 65536
-            && bytes % 2 == 0
+            && bytes.is_multiple_of(2)
         {
             let mut value = vec![0u16; bytes as usize / 2];
             if RegGetValueW(
@@ -109,6 +109,7 @@ fn stored_hub_token() -> Option<String> {
             None,
             Some(&mut size),
         )
+        .ok()
         .ok()?;
         if size == 0 || size > 65536 {
             return None;
@@ -123,6 +124,7 @@ fn stored_hub_token() -> Option<String> {
             Some(bytes.as_mut_ptr().cast()),
             Some(&mut size),
         )
+        .ok()
         .ok()?;
         bytes.truncate(size as usize);
         decrypt_token(&mut bytes)

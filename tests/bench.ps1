@@ -193,7 +193,7 @@ try {
     # Actual WM_KEYDOWN, not synthetic timing values: each sample waits for EndDraw acknowledgement.
     $latencies = @(Key-Latencies $rust)
     $null = Pipe "WazigRust-$($rust.Id)" "select $jid"
-    $null = Wait-For { (Rust-State $rust).messages_loaded -ge 6 -and (Rust-State $rust).messages_visible -gt 0 } 'screenshot fake chat'
+    $null = Wait-For { (Rust-State $rust).messages_loaded -ge 6 -and (Rust-State $rust).messages_visible -gt 0 -and (Rust-State $rust).sidebar_scroll -eq 0 -and (Rust-State $rust).images_cached -gt 0 } 'screenshot fake chat'
     $null = [NativeBench]::SetForegroundWindow($rust.MainWindowHandle)
     $paintBeforeResize = (Rust-State $rust).paints
     $null = [NativeBench]::ShowWindow($rust.MainWindowHandle, 1)

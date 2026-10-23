@@ -205,6 +205,23 @@ impl Painter {
             self.target.PopAxisAlignedClip();
         }
     }
+    pub unsafe fn right_text(
+        &mut self,
+        text: &str,
+        r: D2D_RECT_F,
+        size: f32,
+        bold: bool,
+        rgb: u32,
+    ) {
+        if let Ok((layout, _)) = self.layout(text, r.right - r.left, size, bold) {
+            let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            self.text(text, r, size, bold, rgb);
+            let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+    }
+    pub fn images_cached(&self) -> usize {
+        self.bitmaps.len()
+    }
     unsafe fn bitmap(&mut self, path: &str) -> Result<ID2D1Bitmap> {
         if let Some(i) = self.bitmaps.iter().position(|(p, _)| p == path) {
             let entry = self.bitmaps.remove(i).unwrap();
