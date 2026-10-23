@@ -19,8 +19,8 @@ When `WAZIG_HUB_URL` is set, the app instead uses the same authenticated
 `/v1/wazig/` API as Zig, filtering out non-WhatsApp chats.
 Set `WAZIG_HUB_TOKEN` as well. Saved HKCU Environment values take priority over
 inherited process values, like Zig. HTTPS is required except on loopback.
-Tokens are never written to disk. A token saved only in Zig's encrypted settings
-is **not** imported: explicitly provide the environment token for Rust.
+Tokens are never written to disk. If the environment token is empty, Rust can
+read Zig's existing DPAPI-encrypted HubToken without changing or migrating it.
 
 Only `%LOCALAPPDATA%\WazigRust` is used for Rust fonts, downloaded hub images and
 local unread overrides. Rust never writes Zig's settings. Archive/read/send

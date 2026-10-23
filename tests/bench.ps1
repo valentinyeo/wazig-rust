@@ -8,6 +8,8 @@ public static class NativeBench {
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, UIntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
     [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left, Top, Right, Bottom; }
 }
@@ -21,6 +23,7 @@ $portFile = Join-Path $root 'port.txt'
 $server = Start-Process python -ArgumentList @((Join-Path $PWD 'tests/fake_backend.py'), '--port-file', $portFile) -PassThru -RedirectStandardError (Join-Path $evidence 'backend-errors.txt')
 $script:rust = $null
 $script:zig = $null
+$script:localApp = $null
 
 function Wait-For([scriptblock]$Check, [string]$What, [int]$Seconds = 30) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -64,6 +67,13 @@ function Start-App([string]$Exe, [string]$Kind) {
     $info.Environment['USERNAME'] = "bench-$id"
     $info.Environment['WAZIG_HUB_URL'] = $script:hub
     $info.Environment['WAZIG_HUB_TOKEN'] = 'fixture-key-not-a-secret'
+    if ($Kind -eq 'local') {
+        $info.Environment['WAZIG_HUB_URL'] = ''
+        $info.Environment['WAZIG_HUB_TOKEN'] = ''
+        $cliDir = Join-Path $local 'Programs/wacli'
+        New-Item $cliDir -ItemType Directory -Force | Out-Null
+        Copy-Item 'target/release/fake-wacli.exe' (Join-Path $cliDir 'wacli.exe')
+    }
     foreach ($key in @('DEEPGRAM_API_KEY','OPENROUTER_API_KEY','WA_BRIDGE_KEY','GH_TOKEN','GITHUB_TOKEN')) { $null = $info.Environment.Remove($key) }
     if ($Kind -eq 'zig') {
         $info.ArgumentList.Add('--verify-fixture')
@@ -156,7 +166,7 @@ try {
     $z.app.Refresh(); $rust.Refresh()
     $null = Zig-Control $z @{cmd='select'; id=$jid}
     $null = Zig-Control $z @{cmd='theme'; theme='amoled'}
-    $null = Wait-For { $m = Zig-Control $z @{cmd='messages';limit=80}; @($m).Count -gt 0 } 'Zig messages'
+    $null = Wait-For { $m = Zig-Control $z @{cmd='messages';limit=80}; @($m.messages).Count -ge 5 } 'Zig messages'
     $sendText = 'Synthetic benchmark send from Rust'
     $sent = Pipe "WazigRust-$($rust.Id)" "send $sendText"
     if (-not $sent.ok) { throw 'Control send was rejected' }
@@ -185,6 +195,10 @@ try {
     $null = Pipe "WazigRust-$($rust.Id)" "select $jid"
     $null = Wait-For { (Rust-State $rust).messages_loaded -ge 6 -and (Rust-State $rust).messages_visible -gt 0 } 'screenshot fake chat'
     $null = [NativeBench]::SetForegroundWindow($rust.MainWindowHandle)
+    $paintBeforeResize = (Rust-State $rust).paints
+    $null = [NativeBench]::ShowWindow($rust.MainWindowHandle, 1)
+    $null = [NativeBench]::SetWindowPos($rust.MainWindowHandle, [IntPtr]::Zero, 0, 0, 1920, 1032, 0x0040)
+    $null = Wait-For { (Rust-State $rust).paints -gt $paintBeforeResize } '1920x1032 screenshot repaint'
     $windowRect = [NativeBench+Rect]::new()
     $null = [NativeBench]::GetWindowRect($rust.MainWindowHandle, [ref]$windowRect)
     $bitmap = [Drawing.Bitmap]::new($windowRect.Right-$windowRect.Left, $windowRect.Bottom-$windowRect.Top)
@@ -194,9 +208,24 @@ try {
     finally { $graphics.ReleaseHdc($dc) }
     $bitmap.Save((Join-Path $evidence 'rust-FAKE-data.png'), [Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose(); $bitmap.Dispose()
+    $idlePaint = (Rust-State $rust).paints
+    $null = [NativeBench]::ShowWindow($rust.MainWindowHandle, 3)
+    $null = Wait-For { (Rust-State $rust).paints -gt $idlePaint } 'restored maximized repaint'
     # No sampling/foreground/key input during the two-minute idle period.
     Start-Sleep -Seconds 120
     $rustIdle = Memory $rust; $zigIdle = Memory $zig
+    # Verify the normal-install backend too, including default executable/store paths and exact argv.
+    $localSession = Start-App $rustExe 'local'
+    $script:localApp = $localSession.app
+    $localState = Wait-For { $s = Rust-State $localApp; if ($s.chats -eq 1 -and $s.messages_visible -gt 0) { $s } } 'local wacli default-store history'
+    if ($localState.selected -ne '15550000999@s.whatsapp.net') { throw 'Wrong local-store chat' }
+    $null = Pipe "WazigRust-$($localApp.Id)" 'send Synthetic local store send'
+    $localState = Wait-For { $s = Rust-State $localApp; if ($s.last_send_status -eq 'failed') { throw $s.status }; if ($s.last_send_status -eq 'sent') { $s } } 'local wacli send'
+    $store = Join-Path $localSession.root 'profile/.wacli'
+    if ((Get-Content (Join-Path $store 'sent.txt') -Raw) -ne 'Synthetic local store send') { throw 'Send did not reach default wacli store' }
+    Copy-Item (Join-Path $store 'argv.jsonl') (Join-Path $evidence 'local-wacli-argv.jsonl')
+    $localState | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $evidence 'local-wacli-state.json')
+    Stop-App $localApp; $script:localApp = $null
     $rustBytes = (Get-Item $rustExe).Length; $zigBytes = (Get-Item $zigExe).Length
     $numbers = [ordered]@{
         rust_startup_ms = $rustStartup; rust_observed_startup_ms = $rustObserved; zig_observed_startup_ms = $zigStartup
@@ -223,7 +252,7 @@ try {
 | Private Bytes after 2 minutes idle, MiB | $($rustIdle.private_bytes) | $($zigIdle.private_bytes) |
 | Executable size, bytes | $rustBytes | $zigBytes |
 
-PASS: Rust launched, painted 200 chats, selected a chat, rendered messages, and sent a message confirmed independently by the fake server. Screenshot contains FAKE data only.
+PASS: Rust launched, painted 200 chats, selected a chat, rendered messages, and sent a message confirmed independently by the fake server. The normal-install wacli backend also loaded history and sent successfully through the default executable and store paths with exact argv assertions. Screenshot contains FAKE data only.
 
 Method: ten new processes, fresh isolated profile/cache each time; OS disk cache is not purged (process-cold, not machine-cold). Observed startup uses the same 20 ms control polling, including pipe connection overhead. Zig readiness is chat_count=200 plus a nonzero list-paint counter, a proxy rather than exact first-paint instrumentation. Rust's extra instrumented row measures process creation to the first successful chat-list EndDraw. Latency ends after EndDraw (CPU submission), not physical display scanout. Retained final processes share the same runner and backend; Zig uses its published --verify-fixture isolation exactly as its harness does. Release profile selection: opt-level=z executable $rustBytes bytes versus opt-level=3 $((Get-Item $profile3Exe).Length) bytes; opt-level=3 instrumented startup median $([Math]::Round((Median $profile3Startup),2)) ms and key-to-EndDraw median $([Math]::Round((Median $profile3Keys),2)) ms. The default z favours executable footprint; both candidates were built and measured on this runner. Memory is process WorkingSet64/PrivateMemorySize64, not Task Manager's active private working set.
 "@
@@ -231,5 +260,5 @@ Method: ten new processes, fresh isolated profile/cache each time; OS disk cache
     $report | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
     Write-Output $report
 } finally {
-    Stop-App $script:rust; Stop-App $script:zig; Stop-App $server
+    Stop-App $script:rust; Stop-App $script:zig; Stop-App $script:localApp; Stop-App $server
 }

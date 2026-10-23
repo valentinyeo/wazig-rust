@@ -41,4 +41,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           Copy-Item target/release/wazig-rust.exe WazigRust.exe
-          gh release create "v$env:WAZIG_VERSION" WazigRust.exe --title "Wazig Rust v$env:WAZIG_VERSION" --notes "Native Windows WhatsApp client. Requires an existing wacli login or WAZIG_HUB_URL and WAZIG_HUB_TOKEN. Portable x64 executable."
+          gh release view "v$env:WAZIG_VERSION" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "v$env:WAZIG_VERSION" WazigRust.exe --clobber
+          } else {
+            gh release create "v$env:WAZIG_VERSION" WazigRust.exe --title "Wazig Rust v$env:WAZIG_VERSION" --notes "Native Windows WhatsApp client. Requires an existing wacli login or WAZIG_HUB_URL and WAZIG_HUB_TOKEN. Portable x64 executable."
+          }

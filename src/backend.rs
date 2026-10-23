@@ -48,6 +48,8 @@ fn environment(name: &str) -> String {
         )
         .is_ok()
             && bytes > 2
+            && bytes <= 65536
+            && bytes % 2 == 0
         {
             let mut value = vec![0u16; bytes as usize / 2];
             if RegGetValueW(
@@ -62,7 +64,7 @@ fn environment(name: &str) -> String {
             .is_ok()
             {
                 let value = String::from_utf16_lossy(&value);
-                let value = value.trim_end_matches('\0');
+                let value = value.trim_end_matches('\0').trim();
                 if !value.is_empty() {
                     return value.into();
                 }
@@ -70,6 +72,61 @@ fn environment(name: &str) -> String {
         }
     }
     env::var(name).unwrap_or_default()
+}
+
+fn decrypt_token(bytes: &mut [u8]) -> Option<String> {
+    use windows::Win32::Security::Cryptography::*;
+    unsafe {
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: bytes.len() as u32,
+            pbData: bytes.as_mut_ptr(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut output).ok()?;
+        if output.cbData == 0 || output.pbData.is_null() {
+            let _ = LocalFree(HLOCAL(output.pbData.cast()));
+            return None;
+        }
+        let result = String::from_utf8(
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec(),
+        )
+        .ok();
+        let _ = LocalFree(HLOCAL(output.pbData.cast()));
+        result
+    }
+}
+
+fn stored_hub_token() -> Option<String> {
+    // Read Zig's existing DPAPI token, but never migrate or rewrite its settings.
+    unsafe {
+        let mut size = 0;
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Messages"),
+            w!("HubToken"),
+            RRF_RT_REG_BINARY,
+            None,
+            None,
+            Some(&mut size),
+        )
+        .ok()?;
+        if size == 0 || size > 65536 {
+            return None;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Messages"),
+            w!("HubToken"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(bytes.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+        .ok()?;
+        bytes.truncate(size as usize);
+        decrypt_token(&mut bytes)
+    }
 }
 
 struct HttpHandle(*mut std::ffi::c_void);
@@ -229,7 +286,14 @@ impl Backend {
             } else {
                 Some(Hub {
                     base: url.trim_end_matches('/').into(),
-                    token: environment("WAZIG_HUB_TOKEN"),
+                    token: {
+                        let token = environment("WAZIG_HUB_TOKEN");
+                        if token.is_empty() {
+                            stored_hub_token().unwrap_or_default()
+                        } else {
+                            token
+                        }
+                    },
                 })
             },
             wacli: env::var_os("WAZIG_RUST_WACLI")
@@ -461,4 +525,30 @@ pub fn start(hwnd: HWND, wake: u32) -> (mpsc::Sender<Job>, mpsc::Receiver<Event>
         }
     });
     (tx, receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Security::Cryptography::*;
+    #[test]
+    fn saved_hub_dpapi_format_is_readable_without_touching_settings() {
+        unsafe {
+            let mut fake = b"fixture-key-not-a-secret".to_vec();
+            let input = CRYPT_INTEGER_BLOB {
+                cbData: fake.len() as u32,
+                pbData: fake.as_mut_ptr(),
+            };
+            let mut encrypted = CRYPT_INTEGER_BLOB::default();
+            CryptProtectData(&input, PCWSTR::null(), None, None, None, 0, &mut encrypted).unwrap();
+            let mut bytes =
+                std::slice::from_raw_parts(encrypted.pbData, encrypted.cbData as usize).to_vec();
+            let _ = LocalFree(HLOCAL(encrypted.pbData.cast()));
+            assert_eq!(
+                decrypt_token(&mut bytes).as_deref(),
+                Some("fixture-key-not-a-secret")
+            );
+            assert!(decrypt_token(&mut [1, 2, 3]).is_none());
+        }
+    }
 }

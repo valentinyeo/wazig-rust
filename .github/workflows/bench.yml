@@ -27,6 +27,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'opt-level=3 build failed' }
           Move-Item target/release/wazig-rust.exe target/release/wazig-rust-3.exe -Force
           Move-Item target/release/wazig-rust-z.exe target/release/wazig-rust.exe -Force
+      - name: Build native wacli contract fixture
+        run: rustc --edition 2021 -O tests/fake_wacli.rs -o target/release/fake-wacli.exe
       - name: Verify fake WhatsApp and compare native apps
         shell: pwsh
         env:

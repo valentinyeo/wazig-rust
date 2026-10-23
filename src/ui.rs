@@ -99,6 +99,19 @@ impl App {
             .collect()
     }
     fn select(&mut self, jid: String) {
+        if let Some(next) = self
+            .indices()
+            .iter()
+            .position(|&i| self.chats[i].jid == jid)
+        {
+            let rows = ((self.size().1 - 110.) / 64.).max(1.) as usize;
+            if next < self.list_scroll {
+                self.list_scroll = next;
+            }
+            if next >= self.list_scroll + rows {
+                self.list_scroll = next + 1 - rows;
+            }
+        }
         if self.selected == jid {
             return;
         }
@@ -123,13 +136,6 @@ impl App {
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, indices.len() as isize - 1) as usize;
         self.select(self.chats[indices[next]].jid.clone());
-        let rows = ((self.size().1 - 110.) / 64.).max(1.) as usize;
-        if next < self.list_scroll {
-            self.list_scroll = next;
-        }
-        if next >= self.list_scroll + rows {
-            self.list_scroll = next + 1 - rows;
-        }
     }
     fn send(&mut self, text: String) {
         if text.trim().is_empty() || self.selected.is_empty() {
@@ -317,7 +323,9 @@ impl App {
         }
     }
     fn key(&mut self, key: u32) {
-        self.pending_key = Some(Instant::now());
+        if key == VK_DOWN.0 as u32 {
+            self.pending_key = Some(Instant::now());
+        }
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         if ctrl && key == b'K' as u32 {
@@ -651,12 +659,9 @@ impl App {
                 + if sender { 26. } else { 0. }
                 + if m.quote().is_some() { 64. } else { 0. }
                 + if m.media_type == "image" { 220. } else { 0. };
-            heights.push((h, sender));
+            heights.push((h, sender, if m.reaction.is_empty() { 14. } else { 32. }));
         }
-        let total: f32 = heights
-            .iter()
-            .map(|(h, _)| h + if *h > 0. { 14. } else { 0. })
-            .sum();
+        let total: f32 = heights.iter().map(|(h, _, gap)| h + gap).sum();
         self.message_scroll = self
             .message_scroll
             .clamp(0., (total - (height - 180.)).max(0.));
@@ -666,7 +671,7 @@ impl App {
             &rect(SIDEBAR + 1., 64., width - SIDEBAR - 1., height - 180.),
             windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
         );
-        for (m, (h, sender)) in self.messages.iter().zip(heights) {
+        for (m, (h, sender, gap)) in self.messages.iter().zip(heights) {
             let x = if m.from_me {
                 width - bubble_width - 36.
             } else {
@@ -760,7 +765,7 @@ impl App {
                     );
                 }
             }
-            y += h + 14.;
+            y += h + gap;
         }
         p.target.PopAxisAlignedClip();
         p.fill(
@@ -992,6 +997,13 @@ pub fn run() -> Result<()> {
             instance,
             None,
         )?;
+        let dark = BOOL(1);
+        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const BOOL).cast(),
+            std::mem::size_of_val(&dark) as u32,
+        );
         let (jobs, events) = backend::start(hwnd, WAKE);
         let control = control::start(hwnd, CONTROL);
         let _ = std::fs::create_dir_all(backend::settings_dir());
