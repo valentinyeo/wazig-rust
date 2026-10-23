@@ -582,6 +582,36 @@ pub fn start(hwnd: HWND, wake: u32) -> (mpsc::Sender<Job>, mpsc::Receiver<Event>
             }
         }
     });
+    let (writes, write_rx) = mpsc::channel::<Job>();
+    let write_events = events.clone();
+    thread::spawn(move || {
+        let backend = Backend::new();
+        while let Ok(job) = write_rx.recv() {
+            let event = match job {
+                Job::Send(j, t) => {
+                    let result = backend.send(&j, &t);
+                    Event::Sent(j, t, result)
+                }
+                Job::Archive(j, a) => Event::Changed(backend.archive(&j, a)),
+                Job::MarkRead(j) => {
+                    let _ = backend.mark_read(&j);
+                    continue;
+                }
+                _ => unreachable!(),
+            };
+            if write_events.send(event).is_err() {
+                break;
+            }
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    HWND(window as *mut _),
+                    wake,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
     thread::spawn(move || {
         let mut backend = Backend::new();
         while let Ok(job) = rx.recv() {
@@ -595,13 +625,9 @@ pub fn start(hwnd: HWND, wake: u32) -> (mpsc::Sender<Job>, mpsc::Receiver<Event>
                     let result = backend.messages(&j);
                     Event::Messages(j, result)
                 }
-                Job::Send(j, t) => {
-                    let result = backend.send(&j, &t);
-                    Event::Sent(j, t, result)
-                }
-                Job::Archive(j, a) => Event::Changed(backend.archive(&j, a)),
-                Job::MarkRead(j) => {
-                    let _ = backend.mark_read(&j);
+                job @ (Job::Send(..) | Job::Archive(..) | Job::MarkRead(..)) => {
+                    // A busy store's write lock must never hold up read-only chat/history requests.
+                    let _ = writes.send(job);
                     continue;
                 }
             };

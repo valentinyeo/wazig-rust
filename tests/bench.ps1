@@ -274,8 +274,9 @@ try {
     $localNames = @('Fixture Local Store','Fixture Official Group','Fixture Push Name','Fixture System Name')
     if (($localState.chat_rows.name -join '|') -cne ($localNames -join '|')) { throw 'Contact/group resolution or pinned/timestamp/name order failed' }
     if (($localState.message_ids -join '|') -cne 'BASE|SLOW_IMAGE') { throw 'Wrapped, paginated wacli history not parsed in chronological order' }
+    $null = Wait-For { Test-Path (Join-Path $localSession.root 'profile/.wacli/slow-mark-read') } 'wacli write lock wait started' 3
     $null = Pipe "WazigRust-$($localApp.Id)" 'select 15550000997@s.whatsapp.net'
-    $null = Wait-For { $s = Rust-State $localApp; $s.selected -eq '15550000997@s.whatsapp.net' -and $s.messages_visible -gt 0 } 'switch during blocked media download' 3
+    $null = Wait-For { $s = Rust-State $localApp; $s.selected -eq '15550000997@s.whatsapp.net' -and $s.messages_visible -gt 0 } 'switch during blocked media and mark-read' 3
     $null = Pipe "WazigRust-$($localApp.Id)" 'select 15550000999@s.whatsapp.net'
     $null = Wait-For { (Rust-State $localApp).messages_visible -gt 0 } 'return to local chat' 3
     $fontLicense = Join-Path $localSession.root 'local/WazigRust/fonts/IBM-Plex-LICENSE.txt'

@@ -35,7 +35,7 @@ operations intentionally update the shared WhatsApp backend.
 - E: archive (or unarchive in the archive view); Ctrl+A from list: archive view.
 - U: toggle local unread override; R: refresh; Q: quit (list focus).
 
-Network and child processes run on background workers. Media downloads cannot block history or sends. Chat/history polling
+Network and child processes run on background workers. Media downloads cannot block history or sends; store write-lock waits cannot block history. Chat/history polling
 is every five seconds; selected-chat responses are identity checked. Images
 are fetched only when visible and decoded with WIC at their display dimensions.
 The device-bitmap LRU is capped at 4 MiB and 32 entries (including avatars);
@@ -76,7 +76,7 @@ against 200 entirely fake WhatsApp chats. It independently verifies the server
 received the send, measures ten process startups, fifty Down-to-EndDraw samples,
 Working Set/Private Bytes at load and after two idle minutes, and executable size.
 The bench also checks normal/minimized launcher overrides, contact/group names,
-junk filtering and history with a slow missing photo. Its large-image scenario
+junk filtering and history with a slow missing photo and blocked mark-read. Its large-image scenario
 serves 50 generated 4000×3000 JPEGs across five chats, scrolls both apps through
 their histories, requires all 50 Rust images to be painted, and checks the
 bitmap budget and lazy requests. Private Bytes is compared using twelve samples

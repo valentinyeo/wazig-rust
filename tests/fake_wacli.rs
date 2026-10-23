@@ -130,6 +130,14 @@ fn main() {
                 &args[6]
             ]
         );
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(store.join("slow-mark-read"))
+            .is_ok()
+        {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
         println!(r#"{{"success":true}}"#);
     }
 }
