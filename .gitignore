@@ -4,3 +4,4 @@ GATES.md
 .claude/settings.local.json
 /.unlazy-hook-state.json
 /bench-evidence
+scripts-local
