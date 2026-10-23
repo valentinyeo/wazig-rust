@@ -1,0 +1,30 @@
+name: bench
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'assets/**', '.github/workflows/**', 'tests/**']
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Verify fake WhatsApp and compare native apps
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tests/bench.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-whatsapp-bench
+          path: bench-evidence/
