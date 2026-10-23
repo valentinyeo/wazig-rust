@@ -339,6 +339,24 @@ try {
             $null = [NativeBench]::PostMessage($script:zig.MainWindowHandle, 0x20A, [UIntPtr](280 -shl 16), $point)
             $null = Wait-For { (Zig-Control $largeZ @{cmd='status'}).paints.canvas -gt $zPaint } 'Zig image scroll paint'
         }
+        # Zig downloads serially and refreshes history after each result. Do not leave a
+        # chat before its queue drains, or the next selection can cancel that work.
+        $null = Wait-For {
+            $v = Invoke-RestMethod "$hub/fixture/state" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+            $v | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $evidence 'large-requests.json')
+            $pattern = "*/$([uri]::EscapeDataString($chat.jid))/*"
+            $rc = @($v.media_requests.rust | Where-Object { $_ -like $pattern }).Count
+            $zc = @($v.media_requests.zig | Where-Object { $_ -like $pattern }).Count
+            if ($rc -eq 10 -and $zc -eq 10) { $true }
+        } "both apps downloaded all ten JPEGs for $($chat.jid)" 60
+        # Revisit Zig's whole history after the serial downloads, so comparison includes decoding.
+        for ($step = 0; $step -lt 35; $step++) {
+            $zPaint = (Zig-Control $largeZ @{cmd='status'}).paints.canvas
+            $null = [NativeBench]::PostMessage($script:zig.MainWindowHandle, 0x20A, [UIntPtr]([uint64]65256 -shl 16), $point)
+            $null = Wait-For { (Zig-Control $largeZ @{cmd='status'}).paints.canvas -gt $zPaint } 'Zig cached JPEG scroll paint'
+        }
+        $null = Pipe "WazigRust-$($script:rust.Id)" 'scroll -100000'
+        $null = Wait-For { $v = Rust-State $script:rust; $v.painted_images.Count -gt 0 -and $v.painted_images.Count -eq $v.visible_images.Count } 'Rust final large JPEG viewport'
     }
     if ($seen.Count -ne 50) { throw "Only $($seen.Count)/50 large photos actually painted" }
     $requests = Wait-For {
