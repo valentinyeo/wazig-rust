@@ -273,7 +273,8 @@ impl Painter {
         };
         let scale = (w as f32 / width.max(1) as f32)
             .min(h as f32 / height.max(1) as f32)
-            .min(1.);
+            .min(1.)
+            .min((1024. * 1024. / (width.max(1) as f32 * height.max(1) as f32)).sqrt());
         let (width, height) = (
             (width as f32 * scale).max(1.) as u32,
             (height as f32 * scale).max(1.) as u32,
@@ -378,8 +379,15 @@ mod tests {
             mask_circle(&mut pixels, size);
             assert_eq!(&pixels[..4], &[0; 4]);
             assert_eq!(pixels[(size / 2 * size + size / 2) * 4 + 3], 128);
-            let edge = pixels[(size / 2 * size + size - 1) * 4 + 3];
-            assert!(edge > 0 && edge < 128);
+            assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 128));
+            for y in 0..size {
+                for x in 0..size {
+                    assert_eq!(
+                        pixels[(y * size + x) * 4 + 3],
+                        pixels[(y * size + size - 1 - x) * 4 + 3]
+                    );
+                }
+            }
             for pixel in pixels.chunks_exact(4) {
                 assert_eq!(pixel[0], pixel[3]);
             }

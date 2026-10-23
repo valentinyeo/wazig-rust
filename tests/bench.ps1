@@ -201,7 +201,7 @@ try {
     $null = Zig-Control $z @{cmd='view';messenger='whatsapp'}
     $zc = Zig-Control $z @{cmd='chats';limit=250}
     # The hub normally filters service rows; inject them here to require Rust to reject them too.
-    $zigRows = @($zc.chats | Where-Object { $_.id -notmatch '(0@s.whatsapp.net|status@broadcast)$' })
+    $zigRows = @($zc.chats | Where-Object { $_.id -notmatch '^(personal:)?(0@s\.whatsapp\.net|status@broadcast)$' })
     if ($zigRows.Count -ne 200) { throw "Unexpected Zig comparison count $($zigRows.Count)" }
     for ($i = 0; $i -lt 200; $i++) {
         if ($zigRows[$i].id -cne $expected[$i].jid -or $zigRows[$i].name -cne $expected[$i].name) { throw "Rust/oracle disagrees with Zig at $i" }
