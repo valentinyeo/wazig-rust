@@ -129,7 +129,7 @@ pub fn names(raw: &[u8], groups: bool) -> Result<Vec<(String, String)>, String> 
             let keys: &[&str] = if groups {
                 &["Name"]
             } else {
-                &["alias", "system_name", "name", "phone"]
+                &["alias", "system_name", "name"]
             };
             let name = keys
                 .iter()

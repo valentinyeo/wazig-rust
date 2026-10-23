@@ -58,6 +58,8 @@ function Wait-For([scriptblock]$Check, [string]$What, [int]$Seconds = 30) {
         if ($result) { return $result }
         Start-Sleep -Milliseconds 20
     } while ([DateTime]::UtcNow -lt $deadline)
+    if ($script:rust) { try { Rust-State $script:rust | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'timeout-rust.json') } catch {} }
+    if ($script:zig -and $script:zigSession) { try { Zig-Control $script:zigSession @{cmd='status'} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'timeout-zig.json') } catch {} }
     throw "Timed out waiting for $What"
 }
 function Pipe([string]$Name, [string]$Command, [int]$ConnectTimeout = 200) {
@@ -79,7 +81,7 @@ function Zig-Control($Session, [hashtable]$Command) {
     if (-not $response.ok) { throw "Zig control error: $($response.error)" }
     return $response.result
 }
-function Start-App([string]$Exe, [string]$Kind, [string]$Suffix = '', [int]$Show = -1) {
+function Start-App([string]$Exe, [string]$Kind, [string]$Endpoint = '', [int]$Show = -1) {
     $id = [Guid]::NewGuid().ToString()
     $dir = Join-Path $root "$Kind-$id"
     $local = Join-Path $dir 'local'
@@ -91,7 +93,7 @@ function Start-App([string]$Exe, [string]$Kind, [string]$Suffix = '', [int]$Show
     $info.Environment['APPDATA'] = $local
     $info.Environment['USERPROFILE'] = $profile
     $info.Environment['USERNAME'] = "bench-$id"
-    $info.Environment['WAZIG_HUB_URL'] = $script:hub + $Suffix
+    $info.Environment['WAZIG_HUB_URL'] = if ($Endpoint) { $Endpoint } else { $script:hub }
     $info.Environment['WAZIG_FIXTURE_URL'] = $script:hub
     $info.Environment['WAZIG_HUB_TOKEN'] = 'fixture-key-not-a-secret'
     if ($Kind -eq 'local') {
@@ -292,10 +294,13 @@ try {
     Stop-App $rust; Stop-App $zig
     $script:rust = $null; $script:zig = $null
     # Both large-image processes get fresh profiles and identical 50 x 4000x3000 JPEGs.
-    $largeR = Start-App $rustExe 'rust' '/large/rust'
+    $largeRustHub = 'http://127.0.0.1:' + (Get-Content (Join-Path $root 'large-rust-port.txt') -Raw).Trim()
+    $largeZigHub = 'http://127.0.0.1:' + (Get-Content (Join-Path $root 'large-zig-port.txt') -Raw).Trim()
+    $largeR = Start-App $rustExe 'rust' $largeRustHub
     $script:rust = $largeR.app
-    $largeZ = Start-App $zigExe 'zig' '/large/zig'
+    $largeZ = Start-App $zigExe 'zig' $largeZigHub
     $script:zig = $largeZ.app
+    $script:zigSession = $largeZ
     $null = Wait-For { (Rust-State $script:rust).chats -eq 5 } 'large Rust chat list'
     $null = Wait-For { (Zig-Control $largeZ @{cmd='status'}).chat_count -eq 5 } 'large Zig chat list'
     $null = Zig-Control $largeZ @{cmd='theme';theme='amoled'}

@@ -85,11 +85,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = url.path
-        large = path.startswith("/large/")
-        run = "default"
-        if large:
-            _, _, run, rest = path.split("/", 3)
-            path = "/" + rest
+        large = getattr(self.server, "large", False)
+        run = getattr(self.server, "run", "default")
         query = parse_qs(url.query)
         if path == "/v1/wazig/chats":
             archived = query.get("archived", ["false"])[0] == "true"
@@ -148,7 +145,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 # A quiet SSE connection, like an idle real account.
-                with threading.Condition() as condition:
+                condition = threading.Condition()
+                with condition:
                     condition.wait(timeout=180)
                 self.wfile.write(b": fixture heartbeat\n\n")
             except (ConnectionError, BrokenPipeError):
@@ -210,5 +208,11 @@ if __name__ == "__main__":
         image.save(LARGE_DIR / f"L{i:02d}.jpg", quality=90)
         image.close()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    for run in ("rust", "zig"):
+        large_server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        large_server.large = True
+        large_server.run = run
+        threading.Thread(target=large_server.serve_forever, daemon=True).start()
+        args.port_file.with_name(f"large-{run}-port.txt").write_text(str(large_server.server_port))
     args.port_file.write_text(str(server.server_port))
     server.serve_forever()
