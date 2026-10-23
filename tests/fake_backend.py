@@ -34,9 +34,9 @@ def chat_rows(large=False):
     return rows
 
 
-def expected_rows():
+def expected_rows(large=False):
     # A separate oracle follows chat_order.zig: descending timestamp, UTF-16 name, JID.
-    rows = sorted(chat_rows(), key=lambda c: (c["name"].encode("utf-16-be"), c["jid"]))
+    rows = sorted(chat_rows(large), key=lambda c: (c["name"].encode("utf-16-be"), c["jid"]))
     return sorted(rows, key=lambda c: c["last_message_ts"], reverse=True)
 
 SENDS = {}
@@ -156,7 +156,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self.respond({"sends": list(SENDS.values()), "media_requests": {k: sorted(v) for k, v in REQUESTS.items()}})
         elif path == "/fixture/expected":
-            self.respond(expected_rows())
+            self.respond(expected_rows(large))
         else:
             self.respond({"error": "unknown fixture route"}, 404)
 

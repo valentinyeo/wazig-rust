@@ -307,7 +307,9 @@ try {
     $null = Zig-Control $largeZ @{cmd='theme';theme='amoled'}
     $seen = [Collections.Generic.HashSet[string]]::new()
     $largeTrace = [Collections.Generic.List[object]]::new()
-    foreach ($chat in $expected[0..4]) {
+    $largeExpected = Invoke-RestMethod "$largeRustHub/fixture/expected" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+    if ($largeExpected.Count -ne 5) { throw 'Invalid large-image chat oracle' }
+    foreach ($chat in $largeExpected) {
         $null = Pipe "WazigRust-$($script:rust.Id)" "select $($chat.jid)"
         $null = Zig-Control $largeZ @{cmd='select';id=$chat.jid}
         $null = Wait-For { $s = Rust-State $script:rust; $s.selected -eq $chat.jid -and $s.messages_loaded -eq 10 } 'large Rust history'
@@ -395,5 +397,6 @@ Method: ten new processes, fresh isolated profile/cache each time; OS disk cache
     $report | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
     Write-Output $report
 } finally {
+    if ($largeTrace) { $largeTrace | ConvertTo-Json -Depth 12 | Set-Content (Join-Path $evidence 'large-image-trace.json') }
     Stop-App $script:rust; Stop-App $script:zig; Stop-App $script:localApp; Stop-App $server
 }
