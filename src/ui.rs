@@ -926,6 +926,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             app.invalidate();
             LRESULT(0)
         }
+        WM_GETMINMAXINFO => {
+            let limits = &mut *(lparam.0 as *mut MINMAXINFO);
+            limits.ptMinTrackSize = POINT {
+                x: (900. * app.dpi / 96.) as i32,
+                y: (600. * app.dpi / 96.) as i32,
+            };
+            // Permit spanning monitors and full-resolution off-screen captures on hosted runners.
+            limits.ptMaxTrackSize = POINT { x: 8192, y: 8192 };
+            LRESULT(0)
+        }
         WM_SIZE => {
             if let Some(p) = &app.painter {
                 let _ = p.target.Resize(&D2D_SIZE_U {

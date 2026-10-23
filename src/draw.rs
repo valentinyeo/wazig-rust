@@ -69,6 +69,11 @@ impl Painter {
         let builder = factory.CreateFontSetBuilder()?;
         let dir = settings_dir().join("fonts");
         let _ = std::fs::create_dir_all(&dir);
+        let license = dir.join("IBM-Plex-LICENSE.txt");
+        if !license.exists() {
+            std::fs::write(&license, include_bytes!("../assets/IBM-Plex-LICENSE.txt"))
+                .map_err(|_| windows::core::Error::from_win32())?;
+        }
         for (name, bytes) in [
             (
                 "IBMPlexSans-Regular.ttf",

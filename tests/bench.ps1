@@ -201,6 +201,7 @@ try {
     $null = Wait-For { (Rust-State $rust).paints -gt $paintBeforeResize } '1920x1032 screenshot repaint'
     $windowRect = [NativeBench+Rect]::new()
     $null = [NativeBench]::GetWindowRect($rust.MainWindowHandle, [ref]$windowRect)
+    if ($windowRect.Right-$windowRect.Left -ne 1920 -or $windowRect.Bottom-$windowRect.Top -ne 1032) { throw 'Screenshot window did not reach 1920x1032' }
     $bitmap = [Drawing.Bitmap]::new($windowRect.Right-$windowRect.Left, $windowRect.Bottom-$windowRect.Top)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $dc = $graphics.GetHdc()
@@ -218,6 +219,8 @@ try {
     $localSession = Start-App $rustExe 'local'
     $script:localApp = $localSession.app
     $localState = Wait-For { $s = Rust-State $localApp; if ($s.chats -eq 1 -and $s.messages_visible -gt 0) { $s } } 'local wacli default-store history'
+    $fontLicense = Join-Path $localSession.root 'local/WazigRust/fonts/IBM-Plex-LICENSE.txt'
+    if ((Get-FileHash $fontLicense).Hash -ne (Get-FileHash 'assets/IBM-Plex-LICENSE.txt').Hash) { throw 'Portable font licence missing or incorrect' }
     if ($localState.selected -ne '15550000999@s.whatsapp.net') { throw 'Wrong local-store chat' }
     $null = Pipe "WazigRust-$($localApp.Id)" 'send Synthetic local store send'
     $localState = Wait-For { $s = Rust-State $localApp; if ($s.last_send_status -eq 'failed') { throw $s.status }; if ($s.last_send_status -eq 'sent') { $s } } 'local wacli send'
