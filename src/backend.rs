@@ -22,7 +22,7 @@ pub enum Job {
     MarkRead(String),
 }
 pub enum Event {
-    Chats(Result<Vec<Chat>, String>),
+    Chats(bool, Result<Vec<Chat>, String>),
     Messages(String, Result<Vec<Message>, String>),
     Sent(String, String, Result<(), String>),
     Changed(Result<(), String>),
@@ -432,7 +432,7 @@ pub fn start(hwnd: HWND, wake: u32) -> (mpsc::Sender<Job>, mpsc::Receiver<Event>
         let backend = Backend::new();
         while let Ok(job) = rx.recv() {
             let event = match job {
-                Job::Chats(a) => Event::Chats(backend.chats(a)),
+                Job::Chats(a) => Event::Chats(a, backend.chats(a)),
                 Job::Messages(j) => {
                     let result = backend.messages(&j);
                     Event::Messages(j, result)

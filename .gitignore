@@ -2,3 +2,5 @@
 GATES.md
 .unlazy/
 .claude/settings.local.json
+/.unlazy-hook-state.json
+/bench-evidence

@@ -10,7 +10,9 @@ use std::{
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::*, Storage::FileSystem::PIPE_ACCESS_DUPLEX, System::Pipes::*,
+        Foundation::*,
+        Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX},
+        System::Pipes::*,
         UI::WindowsAndMessaging::PostMessageW,
     },
 };
@@ -66,6 +68,7 @@ pub fn start(hwnd: HWND, wake: u32) -> mpsc::Receiver<Request> {
                 if let Ok(value) = result.recv_timeout(Duration::from_secs(5)) {
                     let _ = writeln!(file, "{value}");
                     let _ = file.flush();
+                    let _ = FlushFileBuffers(pipe);
                 }
             }
             let _ = DisconnectNamedPipe(pipe);

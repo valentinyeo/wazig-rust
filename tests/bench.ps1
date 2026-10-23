@@ -85,6 +85,16 @@ function Median($Values) {
     if ($sorted.Count % 2) { return [double]$sorted[$middle] }
     return ([double]$sorted[$middle-1] + [double]$sorted[$middle]) / 2
 }
+function Key-Latencies($App) {
+    $App.Refresh()
+    $before = @((Rust-State $App).key_to_paint_ms).Count
+    for ($keyIndex = 0; $keyIndex -lt 50; $keyIndex++) {
+        if (-not [NativeBench]::PostMessage($App.MainWindowHandle, 0x100, [UIntPtr]0x28, [IntPtr]::Zero)) { throw 'Cannot post Down key' }
+        $target = $before + $keyIndex + 1
+        $null = Wait-For { @((Rust-State $App).key_to_paint_ms).Count -ge $target } 'Down key painted' 10
+    }
+    return @((Rust-State $App).key_to_paint_ms | Select-Object -Last 50)
+}
 function Stop-App($App) {
     if ($null -ne $App -and -not $App.HasExited) { $App.Kill(); $App.WaitForExit() }
 }
@@ -100,6 +110,21 @@ try {
     Expand-Archive (Join-Path $root 'zig.zip') (Join-Path $root 'zig')
     $zigExe = (Get-ChildItem (Join-Path $root 'zig') -Filter Messages.exe -Recurse | Select-Object -First 1).FullName
     if (-not $zigExe) { throw 'Messages.exe missing from published Zig ZIP' }
+    $profile3Exe = (Resolve-Path 'target/release/wazig-rust-3.exe').Path
+    $profile3Startup = @()
+    for ($i = 0; $i -lt 10; $i++) {
+        $candidate = Start-App $profile3Exe 'rust'
+        $script:rust = $candidate.app
+        $candidateState = Wait-For {
+            if ($candidate.app.HasExited) { throw 'opt-level=3 candidate exited' }
+            try { $s = Rust-State $candidate.app; if ($s.chats -eq 200 -and $null -ne $s.first_chat_painted_unix_ms) { $s } } catch [TimeoutException] {}
+        } 'opt-level=3 first chat paint'
+        $epoch = ([DateTimeOffset]$candidate.app.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()
+        $profile3Startup += ([double]$candidateState.first_chat_painted_unix_ms - $epoch)
+        if ($i -eq 9) { $profile3Keys = @(Key-Latencies $candidate.app) }
+        Stop-App $candidate.app
+        $script:rust = $null
+    }
     $rustStartup = @(); $rustObserved = @(); $zigStartup = @()
     # Each process gets an empty private profile: includes font extraction and media/cache setup.
     for ($i = 0; $i -lt 10; $i++) {
@@ -127,7 +152,7 @@ try {
     $jid = 'personal:15550000001@s.whatsapp.net'
     $selected = Pipe "WazigRust-$($rust.Id)" "select $jid"
     if (-not $selected.ok) { throw 'Rust select failed' }
-    $null = Wait-For { $s = Rust-State $rust; $s.selected -eq $jid -and $s.messages_visible -ge 5 } 'selected chat and rendered bubbles'
+    $null = Wait-For { $s = Rust-State $rust; $s.selected -eq $jid -and $s.messages_loaded -ge 5 -and $s.messages_visible -gt 0 } 'selected chat and rendered bubbles'
     $z.app.Refresh(); $rust.Refresh()
     $null = Zig-Control $z @{cmd='select'; id=$jid}
     $null = Zig-Control $z @{cmd='theme'; theme='amoled'}
@@ -139,18 +164,26 @@ try {
     $backend = Invoke-RestMethod "$hub/fixture/state" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
     if (@($backend.sends | Where-Object { $_.text -eq $sendText -and $_.chat -eq $jid }).Count -ne 1) { throw 'Server did not receive exactly one valid send' }
     $null = Wait-For { (Rust-State $rust).messages_loaded -ge 6 } 'sent message history reload'
+    # Drive real keyboard input too, including the command popup and C focus shortcut.
+    $rust.Refresh()
+    if (-not [NativeBench]::SetForegroundWindow($rust.MainWindowHandle)) { throw 'Cannot focus Rust keyboard test' }
+    [Windows.Forms.SendKeys]::SendWait('^k')
+    $null = Wait-For { (Rust-State $rust).focus -eq 'commands' } 'Ctrl+K command popup'
+    [Windows.Forms.SendKeys]::SendWait('{ESC}c')
+    $null = Wait-For { $s = Rust-State $rust; $s.focus -eq 'composer' -and $s.composer_characters -eq 0 } 'C shortcut without inserting c'
+    [Windows.Forms.SendKeys]::SendWait('Synthetic keyboard send{ENTER}')
+    $null = Wait-For {
+        $b = Invoke-RestMethod "$hub/fixture/state" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+        @($b.sends | Where-Object { $_.text -eq 'Synthetic keyboard send' }).Count -eq 1
+    } 'Enter key sends composer text'
+    $null = Wait-For { (Rust-State $rust).last_send_status -eq 'sent' } 'keyboard send acknowledgement'
+    [Windows.Forms.SendKeys]::SendWait('{ESC}')
+    $null = Wait-For { (Rust-State $rust).focus -eq 'list' } 'Esc back to list'
     $rustLoad = Memory $rust; $zigLoad = Memory $zig
     # Actual WM_KEYDOWN, not synthetic timing values: each sample waits for EndDraw acknowledgement.
-    $rust.Refresh()
-    $before = @((Rust-State $rust).key_to_paint_ms).Count
-    for ($i = 0; $i -lt 50; $i++) {
-        if (-not [NativeBench]::PostMessage($rust.MainWindowHandle, 0x100, [UIntPtr]0x28, [IntPtr]::Zero)) { throw 'Cannot post Down key' }
-        $target = $before + $i + 1
-        $null = Wait-For { @((Rust-State $rust).key_to_paint_ms).Count -ge $target } 'Down key painted' 10
-    }
-    $latencies = @((Rust-State $rust).key_to_paint_ms | Select-Object -Last 50)
+    $latencies = @(Key-Latencies $rust)
     $null = Pipe "WazigRust-$($rust.Id)" "select $jid"
-    $null = Wait-For { (Rust-State $rust).messages_visible -ge 6 } 'screenshot fake chat'
+    $null = Wait-For { (Rust-State $rust).messages_loaded -ge 6 -and (Rust-State $rust).messages_visible -gt 0 } 'screenshot fake chat'
     $null = [NativeBench]::SetForegroundWindow($rust.MainWindowHandle)
     $windowRect = [NativeBench+Rect]::new()
     $null = [NativeBench]::GetWindowRect($rust.MainWindowHandle, [ref]$windowRect)
@@ -169,6 +202,7 @@ try {
         rust_startup_ms = $rustStartup; rust_observed_startup_ms = $rustObserved; zig_observed_startup_ms = $zigStartup
         rust_key_to_paint_ms = $latencies; rust_load = $rustLoad; zig_load = $zigLoad
         rust_idle = $rustIdle; zig_idle = $zigIdle; rust_exe_bytes = $rustBytes; zig_exe_bytes = $zigBytes
+        profile3_startup_ms = $profile3Startup; profile3_keys_ms = $profile3Keys; profile3_exe_bytes = (Get-Item $profile3Exe).Length
         zig_version = $latest.tagName; rust_commit = $env:GITHUB_SHA
         state = (Rust-State $rust); backend_send_count = $backend.sends.Count
     }
@@ -191,7 +225,7 @@ try {
 
 PASS: Rust launched, painted 200 chats, selected a chat, rendered messages, and sent a message confirmed independently by the fake server. Screenshot contains FAKE data only.
 
-Method: ten new processes, fresh isolated profile/cache each time; OS disk cache is not purged (process-cold, not machine-cold). Observed startup uses the same 20 ms control polling, including pipe connection overhead. Zig readiness is chat_count=200 plus a nonzero list-paint counter, a proxy rather than exact first-paint instrumentation. Rust's extra instrumented row measures process creation to the first successful chat-list EndDraw. Latency ends after EndDraw (CPU submission), not physical display scanout. Retained final processes share the same runner and backend; Zig uses its published --verify-fixture isolation exactly as its harness does. Rust opt-level=z; no opt-level=3 comparison has been measured. Memory is process WorkingSet64/PrivateMemorySize64, not Task Manager's active private working set.
+Method: ten new processes, fresh isolated profile/cache each time; OS disk cache is not purged (process-cold, not machine-cold). Observed startup uses the same 20 ms control polling, including pipe connection overhead. Zig readiness is chat_count=200 plus a nonzero list-paint counter, a proxy rather than exact first-paint instrumentation. Rust's extra instrumented row measures process creation to the first successful chat-list EndDraw. Latency ends after EndDraw (CPU submission), not physical display scanout. Retained final processes share the same runner and backend; Zig uses its published --verify-fixture isolation exactly as its harness does. Release profile selection: opt-level=z executable $rustBytes bytes versus opt-level=3 $((Get-Item $profile3Exe).Length) bytes; opt-level=3 instrumented startup median $([Math]::Round((Median $profile3Startup),2)) ms and key-to-EndDraw median $([Math]::Round((Median $profile3Keys),2)) ms. The default z favours executable footprint; both candidates were built and measured on this runner. Memory is process WorkingSet64/PrivateMemorySize64, not Task Manager's active private working set.
 "@
     $report | Set-Content (Join-Path $evidence 'bench.md')
     $report | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

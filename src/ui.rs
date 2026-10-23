@@ -71,6 +71,7 @@ struct App {
     visible: usize,
     dpi: f32,
     surrogate: Option<u16>,
+    suppress_c: bool,
 }
 impl App {
     fn refresh(&mut self) {
@@ -141,8 +142,12 @@ impl App {
     fn events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::Chats(result) => {
+                Event::Chats(archived, result) => {
                     self.chats_pending = false;
+                    if archived != self.archived {
+                        self.refresh();
+                        continue;
+                    }
                     match result {
                         Ok(chats) => {
                             self.chats = chats;
@@ -207,7 +212,9 @@ impl App {
     }
     fn state(&self) -> serde_json::Value {
         json!({"chats":self.chats.len(),"selected":self.selected,"messages_visible":self.visible,
-            "messages_loaded":self.messages.len(),"last_send_status":self.last_send_status,"status":self.status,
+            "messages_loaded":self.messages.len(),
+            "focus":match self.focus {Focus::List=>"list",Focus::Search=>"search",Focus::Composer=>"composer",Focus::Commands=>"commands",Focus::Help=>"help"},
+            "search_matches":self.indices().len(),"composer_characters":self.draft.chars().count(),"last_send_status":self.last_send_status,"status":self.status,
             "first_chat_painted_ms":self.first_paint_ms,"first_chat_painted_unix_ms":self.first_paint_unix_ms,
             "key_to_paint_ms":self.latencies,"paints":self.paints,"archived":self.archived,
             "title":format!("Wazig Rust v{}",version())})
@@ -274,6 +281,41 @@ impl App {
             _ => {}
         }
     }
+    fn paste(&mut self) {
+        use windows::Win32::System::{DataExchange::*, Memory::*};
+        if self.focus == Focus::List || self.focus == Focus::Help {
+            return;
+        }
+        unsafe {
+            if OpenClipboard(self.hwnd).is_err() {
+                return;
+            }
+            if let Ok(handle) = GetClipboardData(13) {
+                let memory = HGLOBAL(handle.0);
+                let size = GlobalSize(memory).min(128 * 1024) / 2;
+                let ptr = GlobalLock(memory) as *const u16;
+                if !ptr.is_null() {
+                    let units = std::slice::from_raw_parts(ptr, size);
+                    let end = units.iter().position(|&u| u == 0).unwrap_or(size);
+                    let value = String::from_utf16_lossy(&units[..end]).replace("\r\n", "\n");
+                    match self.focus {
+                        Focus::Composer => self.draft.push_str(&value),
+                        Focus::Search => {
+                            self.search.push_str(&value.replace('\n', " "));
+                            self.list_scroll = 0;
+                        }
+                        Focus::Commands => {
+                            self.command.push_str(&value.replace('\n', " "));
+                            self.command_index = 0;
+                        }
+                        _ => {}
+                    }
+                    let _ = GlobalUnlock(memory);
+                }
+            }
+            let _ = CloseClipboard();
+        }
+    }
     fn key(&mut self, key: u32) {
         self.pending_key = Some(Instant::now());
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -284,6 +326,8 @@ impl App {
             self.command_index = 0;
         } else if ctrl && key == b'F' as u32 {
             self.focus = Focus::Search;
+        } else if ctrl && key == b'V' as u32 {
+            self.paste();
         } else if key == VK_ESCAPE.0 as u32 {
             self.focus = Focus::List;
             self.search.clear();
@@ -323,7 +367,10 @@ impl App {
             match key {
                 0x28 | 0x4a => self.move_chat(1),
                 0x26 | 0x4b => self.move_chat(-1),
-                0x43 => self.focus = Focus::Composer,
+                0x43 => {
+                    self.focus = Focus::Composer;
+                    self.suppress_c = true;
+                }
                 0x52 => self.refresh(),
                 0x51 => unsafe {
                     let _ = DestroyWindow(self.hwnd);
@@ -361,6 +408,12 @@ impl App {
         self.invalidate();
     }
     fn character(&mut self, unit: u16) {
+        if self.suppress_c {
+            self.suppress_c = false;
+            if unit == b'c' as u16 || unit == b'C' as u16 {
+                return;
+            }
+        }
         if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 {
             return;
         }
@@ -978,6 +1031,7 @@ pub fn run() -> Result<()> {
             visible: 0,
             dpi: GetDpiForWindow(hwnd) as f32,
             surrogate: None,
+            suppress_c: false,
         });
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *app as *mut App) as isize);
         let _ = ShowWindow(hwnd, SW_MAXIMIZE);
