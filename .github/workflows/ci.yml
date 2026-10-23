@@ -20,7 +20,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: rustfmt --edition 2021 --check src/*.rs tests/fake_wacli.rs
+      - run: cargo fmt --all -- --check
+      - run: rustfmt --edition 2021 --check tests/fake_wacli.rs
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
       - run: cargo build --release

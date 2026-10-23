@@ -189,11 +189,14 @@ try {
         $zigStartup += $z.clock.Elapsed.TotalMilliseconds
         if ($i -lt 9) { Stop-App $z.app; $script:zig = $null }
     }
-    $expected = @(Invoke-RestMethod "$hub/fixture/expected" -Headers @{Authorization='Bearer fixture-key-not-a-secret'})
+    $expected = Invoke-RestMethod "$hub/fixture/expected" -Headers @{Authorization='Bearer fixture-key-not-a-secret'}
+    if ($expected.Count -ne 200) { throw "Invalid fixture oracle count $($expected.Count)" }
     $state = Rust-State $rust
+    $state | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'round2-chat-state.json')
+    $expected | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $evidence 'round2-expected.json')
     if ($state.chat_rows.Count -ne 200) { throw 'Rust junk filtering failed' }
     for ($i = 0; $i -lt 200; $i++) {
-        if ($state.chat_rows[$i].jid -cne $expected[$i].jid -or $state.chat_rows[$i].name -cne $expected[$i].name) { throw "Wrong Rust order/name at $i" }
+        if ($state.chat_rows[$i].jid -cne $expected[$i].jid -or $state.chat_rows[$i].name -cne $expected[$i].name) { throw "Wrong Rust order/name at ${i}: got $($state.chat_rows[$i].jid)/$($state.chat_rows[$i].name), expected $($expected[$i].jid)/$($expected[$i].name)" }
     }
     $null = Zig-Control $z @{cmd='view';messenger='whatsapp'}
     $zc = Zig-Control $z @{cmd='chats';limit=250}
@@ -285,6 +288,7 @@ try {
     $null = Wait-For { (Rust-State $localApp).painted_avatars -gt 0 } 'wacli profile URL and round mask' 45
     Stop-App $localApp; $script:localApp = $null
     Write-Output 'ROUND2 PASS: maximized order names messages'
+    Write-Output 'ROUND2 PASS: round photo avatars'
     Stop-App $rust; Stop-App $zig
     $script:rust = $null; $script:zig = $null
     # Both large-image processes get fresh profiles and identical 50 x 4000x3000 JPEGs.

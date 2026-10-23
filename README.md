@@ -35,10 +35,15 @@ operations intentionally update the shared WhatsApp backend.
 - E: archive (or unarchive in the archive view); Ctrl+A from list: archive view.
 - U: toggle local unread override; R: refresh; Q: quit (list focus).
 
-Network and child processes run on a background worker. Chat/history polling
+Network and child processes run on background workers. Media downloads cannot block history or sends. Chat/history polling
 is every five seconds; selected-chat responses are identity checked. Images
-use an eight-entry device-bitmap LRU capped at 960 pixels on the long edge.
-Text layouts use a 256-entry cache.
+are fetched only when visible and decoded with WIC at their display dimensions.
+The device-bitmap LRU is capped at 4 MiB and 32 entries (including avatars);
+decoders and pixel buffers are released after upload. Avatars use Zig's
+premultiplied round mask. Text layouts use a 256-entry cache.
+Contact aliases, system/push names and the official local group metadata store
+resolve sidebar names. Chats use Zig's pinned/newest/name/JID ordering and hide
+service/junk entries.
 
 This is an initial comparison client, not a full replacement: no QR login UI,
 attachment sending, editing/selection in the custom composer, on-screen reaction
@@ -56,6 +61,7 @@ Send one UTF-8 newline-terminated command, read one JSON line:
 - `state`: chat count, selection, visible/loaded message counts, send status,
   focus, paint count, first-chat paint timing and key-to-EndDraw samples.
 - `select <jid>`: select a known chat (marks read).
+- `scroll <pixels>`: scroll the selected history toward older messages.
 - `send <text>`: send to the selected chat; poll `last_send_status`.
 
 Do not expose the pipe to untrusted local processes: send is a real backend action.
@@ -63,11 +69,18 @@ Do not expose the pipe to untrusted local processes: send is a real backend acti
 ## Verification and measurement
 
 **Do not build/test/run on the VPS.** The `ci` workflow runs release clippy,
-tests and build on hosted Windows, then publishes a versioned executable.
+tests and build on hosted Windows. A release is published only after both CI
+and the native benchmark pass on the same commit.
 The `bench` workflow launches both Rust and the latest published Zig executable
 against 200 entirely fake WhatsApp chats. It independently verifies the server
 received the send, measures ten process startups, fifty Down-to-EndDraw samples,
 Working Set/Private Bytes at load and after two idle minutes, and executable size.
+The bench also checks normal/minimized launcher overrides, contact/group names,
+junk filtering and history with a slow missing photo. Its large-image scenario
+serves 50 generated 4000×3000 JPEGs across five chats, scrolls both apps through
+their histories, requires all 50 Rust images to be painted, and checks the
+bitmap budget and lazy requests. Private Bytes is compared using twelve samples
+over a quiet minute after traversal, without trimming either working set.
 A fake-data screenshot, raw measurements and `bench.md` are Actions artifacts.
 See the job summary for numbers and measurement caveats (including Zig's startup
 paint-counter proxy and process-cold, not machine-cold, startup).
