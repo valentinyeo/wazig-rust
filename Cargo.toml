@@ -1,9 +1,12 @@
 [package]
 name = "wazig-rust"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
-description = "Native Win32 WhatsApp client using Direct2D and DirectWrite"
+description = "Native Win32 WhatsApp client using software rendering and DirectWrite"
+
+[features]
+software-wic = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

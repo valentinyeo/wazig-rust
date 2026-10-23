@@ -9,6 +9,7 @@ use windows::{
             DirectWrite::*,
             Dxgi::Common::*,
             Imaging::*,
+            Gdi::*,
         },
         System::Com::*,
     },
@@ -35,8 +36,16 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
     }
 }
 
+enum Surface {
+    #[cfg(not(feature = "software-wic"))]
+    Dc(ID2D1DCRenderTarget),
+    #[cfg(feature = "software-wic")]
+    Wic(IWICBitmap),
+}
+
 pub struct Painter {
-    pub target: ID2D1HwndRenderTarget,
+    pub target: ID2D1RenderTarget,
+    surface: Surface,
     factory: IDWriteFactory,
     fonts: IDWriteFontCollection,
     brush: ID2D1SolidColorBrush,
@@ -48,23 +57,35 @@ pub struct Painter {
 impl Painter {
     pub unsafe fn new(hwnd: HWND, width: u32, height: u32, dpi: f32) -> Result<Self> {
         let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let target = d2d.CreateHwndRenderTarget(
-            &D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                },
-                dpiX: dpi,
-                dpiY: dpi,
-                ..Default::default()
+        let properties = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
             },
-            &D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                hwnd,
-                pixelSize: D2D_SIZE_U { width, height },
-                presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-            },
-        )?;
+            dpiX: dpi,
+            dpiY: dpi,
+            ..Default::default()
+        };
+        let wic: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        #[cfg(feature = "software-wic")]
+        let (target, surface) = {
+            let bitmap = wic.CreateBitmap(
+                width.max(1),
+                height.max(1),
+                &GUID_WICPixelFormat32bppBGR,
+                WICBitmapCacheOnLoad,
+            )?;
+            let target = d2d.CreateWicBitmapRenderTarget(&bitmap, &properties)?;
+            (target, Surface::Wic(bitmap))
+        };
+        #[cfg(not(feature = "software-wic"))]
+        let (target, surface) = {
+            let dc = d2d.CreateDCRenderTarget(&properties)?;
+            (dc.cast()?, Surface::Dc(dc))
+        };
+        let _ = (hwnd, width, height);
         let brush = target.CreateSolidColorBrush(&color(WHITE), None)?;
         let factory: IDWriteFactory3 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let builder = factory.CreateFontSetBuilder()?;
@@ -106,9 +127,9 @@ impl Painter {
         let fonts = factory
             .CreateFontCollectionFromFontSet(&builder.CreateFontSet()?)?
             .cast()?;
-        let wic = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         Ok(Self {
             target,
+            surface,
             brush,
             factory: factory.cast()?,
             fonts,
@@ -117,6 +138,53 @@ impl Painter {
             bitmaps: VecDeque::new(),
             bitmap_bytes: 0,
         })
+    }
+    pub unsafe fn begin(&self, dc: HDC, width: u32, height: u32) -> Result<()> {
+        match &self.surface {
+            #[cfg(not(feature = "software-wic"))]
+            Surface::Dc(target) => target.BindDC(dc, &RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            })?,
+            #[cfg(feature = "software-wic")]
+            Surface::Wic(_) => { let _ = (dc, width, height); }
+        }
+        self.target.BeginDraw();
+        self.target.Clear(Some(&color(0)));
+        Ok(())
+    }
+    pub unsafe fn end(&self, dc: HDC) -> Result<()> {
+        self.target.EndDraw(None, None)?;
+        match &self.surface {
+            #[cfg(not(feature = "software-wic"))]
+            Surface::Dc(_) => { let _ = dc; }
+            #[cfg(feature = "software-wic")]
+            Surface::Wic(bitmap) => {
+                let (mut width, mut height) = (0, 0);
+                bitmap.GetSize(&mut width, &mut height)?;
+                let lock = bitmap.Lock(&WICRect { X: 0, Y: 0, Width: width as i32, Height: height as i32 }, WICBitmapLockRead.0 as u32)?;
+                let (mut length, mut bits) = (0, std::ptr::null_mut());
+                lock.GetDataPointer(&mut length, &mut bits)?;
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width as i32,
+                        biHeight: -(height as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                if StretchDIBits(dc, 0, 0, width as i32, height as i32, 0, 0, width as i32, height as i32, Some(bits.cast()), &info, DIB_RGB_COLORS, SRCCOPY) == 0 {
+                    return Err(windows::core::Error::from_win32());
+                }
+            }
+        }
+        Ok(())
     }
     pub unsafe fn fill(&self, r: D2D_RECT_F, radius: f32, rgb: u32) {
         self.brush.SetColor(&color(rgb));

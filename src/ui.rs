@@ -517,7 +517,7 @@ impl App {
     }
     unsafe fn paint(&mut self) {
         let mut ps = PAINTSTRUCT::default();
-        let _ = BeginPaint(self.hwnd, &mut ps);
+        let dc = BeginPaint(self.hwnd, &mut ps);
         let (width, height) = self.size();
         if self.painter.is_none() {
             self.painter = Painter::new(
@@ -529,15 +529,13 @@ impl App {
             .ok();
         }
         if let Some(mut p) = self.painter.take() {
-            p.target.BeginDraw();
-            p.target.Clear(Some(&D2D1_COLOR_F {
-                r: 0.,
-                g: 0.,
-                b: 0.,
-                a: 1.,
-            }));
+            if p.begin(dc, (width * self.dpi / 96.) as u32, (height * self.dpi / 96.) as u32).is_err() {
+                let _ = EndPaint(self.hwnd, &ps);
+                self.invalidate();
+                return;
+            }
             self.draw(&mut p, width, height);
-            if p.target.EndDraw(None, None).is_ok() {
+            if p.end(dc).is_ok() {
                 self.paints += 1;
                 if !self.chats.is_empty() && self.first_paint_ms.is_none() {
                     self.first_paint_ms = Some(self.started.elapsed().as_secs_f64() * 1000.);
@@ -993,12 +991,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(p) = &app.painter {
-                let _ = p.target.Resize(&D2D_SIZE_U {
-                    width: (lparam.0 as u32) & 0xffff,
-                    height: ((lparam.0 as u32) >> 16) & 0xffff,
-                });
-            }
+            app.painter = None;
             app.invalidate();
             LRESULT(0)
         }
